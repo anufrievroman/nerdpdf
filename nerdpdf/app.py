@@ -9,7 +9,7 @@ from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QVBoxLayout, QWidget)
 
-from .view import PdfView
+from .view import PdfView, looks_like_slides
 
 
 class SearchLine(QLineEdit):
@@ -32,10 +32,11 @@ class MainWindow(QMainWindow):
         self.path = None
 
         self.view = PdfView()
-        self.view.fit_mode = self.settings.value("fit_mode", "width") or None
-        self.view.zoom = float(self.settings.value("zoom", 1.0))
+        # remembered zoom for regular documents; slides always open fitted to the page
+        self.zoom_pref = (float(self.settings.value("zoom", 1.0)),
+                          self.settings.value("fit_mode", "width") or None)
 
-        self.search_line = SearchLine(placeholderText="Search  (Enter: next, Shift+Enter: previous, Esc: close)")
+        self.search_line = SearchLine(placeholderText="Search  (Enter: find, then n/N: next/previous, Esc: close)")
         self.search_status = QLabel()
         self.search_bar = QWidget()
         bar = QHBoxLayout(self.search_bar)
@@ -57,7 +58,10 @@ class MainWindow(QMainWindow):
         self.view.searchRequested.connect(self.show_search)
         self.view.openRequested.connect(self.open_dialog)
         self.view.quitRequested.connect(self.close)
-        self.search_line.search.connect(self._search)
+        self.view.searchStep.connect(lambda forward: self._search(self.search_line.text(), forward))
+        self.view.escapePressed.connect(self._escape)
+        self.view.fullscreenRequested.connect(self.toggle_fullscreen)
+        self.search_line.search.connect(self._search_from_bar)
         self.search_line.closed.connect(self.hide_search)
 
         geometry = self.settings.value("geometry")
@@ -83,13 +87,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "nerdpdf", f"Cannot open {path}:\n{e}")
             return
         self._save_position()
+        self._remember_zoom()
         self.path = path
         self.hide_search()
+        if looks_like_slides(doc):
+            self.view.zoom, self.view.fit_mode = self.zoom_pref[0], "page"
+        else:
+            self.view.zoom, self.view.fit_mode = self.zoom_pref
         self.view.set_document(doc)
         pos = self.settings.value(self._pos_key(path))
         if pos:
             self.view.set_position(int(pos[0]), float(pos[1]))
         self._update_title()
+
+    def _remember_zoom(self):
+        if self.path and not self.view.presentation:
+            self.zoom_pref = (self.view.zoom, self.view.fit_mode)
 
     def open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", os.path.dirname(self.path or ""),
@@ -119,6 +132,12 @@ class MainWindow(QMainWindow):
         self.view.clear_search()
         self.view.setFocus()
 
+    def _search_from_bar(self, query, forward):
+        # hand focus back to the document so n/N step through the matches
+        self._search(query, forward)
+        if self.view.search_active():
+            self.view.setFocus()
+
     def _search(self, query, forward):
         result = self.view.search(query, forward)
         if not query:
@@ -131,6 +150,15 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------------- misc
 
+    def toggle_fullscreen(self):
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+
+    def _escape(self):
+        if self.search_bar.isVisible():
+            self.hide_search()
+        elif self.isFullScreen():
+            self.showNormal()
+
     def _update_title(self):
         if not self.path:
             self.setWindowTitle("nerdpdf")
@@ -141,8 +169,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self._save_position()
-        self.settings.setValue("zoom", self.view.zoom)
-        self.settings.setValue("fit_mode", self.view.fit_mode or "")
+        self._remember_zoom()
+        self.settings.setValue("zoom", self.zoom_pref[0])
+        self.settings.setValue("fit_mode", self.zoom_pref[1] or "")
         self.settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(ev)
 

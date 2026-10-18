@@ -16,6 +16,8 @@ LINE_STEP = 60  # px per j/k press
 FULL_RENDER_LIMIT = 24_000_000  # device px; bigger pages render only their visible part
 CACHE_BYTES = 256 * 1024 * 1024
 
+SLIDE_RATIOS = (4 / 3, 16 / 10, 16 / 9)
+
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_HIT_COLOR = QColor(255, 140, 0, 170)
 
@@ -26,9 +28,20 @@ def _to_qimage(pix, dpr):
     return img
 
 
+def looks_like_slides(doc):
+    """True if the first page has a landscape 4:3, 16:10 or 16:9 shape."""
+    if not len(doc):
+        return False
+    r = doc[0].rect
+    return r.height > 0 and any(abs(r.width / r.height - k) / k < 0.02 for k in SLIDE_RATIOS)
+
+
 class PdfView(QAbstractScrollArea):
     stateChanged = Signal()  # page or zoom changed
     searchRequested = Signal()
+    searchStep = Signal(bool)  # n/N while a search is active; True = forward
+    escapePressed = Signal()
+    fullscreenRequested = Signal()
     openRequested = Signal()
     quitRequested = Signal()
 
@@ -40,6 +53,7 @@ class PdfView(QAbstractScrollArea):
         self.doc_w = self.doc_h = 0.0
         self.zoom = 1.0
         self.fit_mode = "width"  # "width", "page" or None (free zoom)
+        self.presentation = False  # slides: space/backspace flip pages
 
         self._cache = OrderedDict()  # page -> (scale, QImage) full-page renders
         self._cache_bytes = 0
@@ -49,6 +63,7 @@ class PdfView(QAbstractScrollArea):
         self._current_hit = None  # (page, index)
         self._count = ""  # vim count prefix
         self._g_pending = False
+        self._drag_from = None  # last mouse position while middle-button panning
 
         self._render_timer = QTimer(self, singleShot=True, interval=90)
         self._render_timer.timeout.connect(self._render_visible)
@@ -69,6 +84,7 @@ class PdfView(QAbstractScrollArea):
         self._cache_bytes = 0
         self._clips.clear()
         self.clear_search()
+        self.presentation = looks_like_slides(doc)
         if self.fit_mode:
             self.zoom = self._fit_zoom(0, self.fit_mode)
         self._relayout()
@@ -220,6 +236,9 @@ class PdfView(QAbstractScrollArea):
         self.verticalScrollBar().setValue(round(y))
 
     # ------------------------------------------------------------------ search
+
+    def search_active(self):
+        return self._current_hit is not None
 
     def clear_search(self):
         self._query = ""
@@ -410,6 +429,31 @@ class PdfView(QAbstractScrollArea):
             return
         super().wheelEvent(ev)
 
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MiddleButton:
+            self._drag_from = ev.position()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._drag_from is not None:
+            d = ev.position() - self._drag_from
+            self._drag_from = ev.position()
+            self.scroll_by(-round(d.x()), -round(d.y()))
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MiddleButton and self._drag_from is not None:
+            self._drag_from = None
+            self.viewport().unsetCursor()
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
     def viewportEvent(self, ev):
         if ev.type() == QEvent.NativeGesture and ev.gestureType() == Qt.ZoomNativeGesture:
             self.zoom_by(1 + ev.value(), ev.position())
@@ -440,13 +484,20 @@ class PdfView(QAbstractScrollArea):
             self.scroll_by(-LINE_STEP * n, 0)
         elif t == "l" or key == Qt.Key_Right:
             self.scroll_by(LINE_STEP * n, 0)
+        elif t in ("n", "N") and self.search_active():
+            for _ in range(n):
+                self.searchStep.emit(t == "n")
         elif t in ("J", "n"):
             self.next_page(n)
         elif t in ("K", "p"):
             self.prev_page(n)
+        elif key == Qt.Key_Space and self.presentation:
+            self.prev_page(n) if ev.modifiers() & Qt.ShiftModifier else self.next_page(n)
+        elif key == Qt.Key_Backspace and self.presentation:
+            self.prev_page(n)
         elif key in (Qt.Key_PageDown, Qt.Key_Space) and not ev.modifiers() & Qt.ShiftModifier:
             self.scroll_by(0, int(vh * 0.9))
-        elif key in (Qt.Key_PageUp, Qt.Key_Space):
+        elif key in (Qt.Key_PageUp, Qt.Key_Space, Qt.Key_Backspace):
             self.scroll_by(0, -int(vh * 0.9))
         elif t == "g":
             self._g_pending = True
@@ -468,7 +519,9 @@ class PdfView(QAbstractScrollArea):
         elif t == "/":
             self.searchRequested.emit()
         elif key == Qt.Key_Escape:
-            self.clear_search()
+            self.escapePressed.emit()
+        elif t in ("f", "F"):
+            self.fullscreenRequested.emit()
         elif t == "o":
             self.openRequested.emit()
         elif t == "q":
