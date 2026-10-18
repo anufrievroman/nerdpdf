@@ -4,11 +4,11 @@ Writes nerdpdf/icons/nerdpdf.svg, nerdpdf.png (1024 px) and, on macOS, nerdpdf.i
 Run with: .venv/bin/python tools/make_icon.py
 """
 
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, Qt
@@ -21,7 +21,7 @@ FONT = "Helvetica Neue, Helvetica, Arial, sans-serif"
 
 
 def version():
-    return tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    return re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / "pyproject.toml").read_text(), re.M).group(1)
 
 
 def svg():

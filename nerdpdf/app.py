@@ -9,13 +9,13 @@ from bisect import bisect_left
 
 import pymupdf
 from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPixmap
-from PySide6.QtWidgets import (QApplication, QColorDialog, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor, QIcon
+from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+                               QMessageBox, QVBoxLayout, QWidget)
 
 from . import __version__
-from .view import ANNOT_STYLE, PdfView, is_image, looks_like_slides
+from .annots import SettingsDialog, load_annot_style
+from .view import PdfView, is_image_doc
 
 
 DOC_TYPES = "*.pdf *.epub *.xps *.cbz"
@@ -37,6 +37,15 @@ def _load(path):
     return doc
 
 
+def _load_or_warn(path, parent):
+    """_load(path), or None after telling the user why it failed."""
+    try:
+        return _load(path)
+    except Exception as e:
+        QMessageBox.warning(parent, "nerdpdf", f"Cannot open {path}:\n{e}")
+        return None
+
+
 def _folder_images(directory):
     """Image files directly in directory (not recursive), in natural order."""
     try:
@@ -46,69 +55,6 @@ def _folder_images(directory):
     names = [n for n in names if not n.startswith(".") and os.path.splitext(n)[1].lower() in IMAGE_EXTS
              and os.path.isfile(os.path.join(directory, n))]
     return sorted(names, key=_natural_key)
-
-
-def load_annot_style(settings):
-    """ANNOT_STYLE with the values saved from the Settings dialog."""
-    style = dict(ANNOT_STYLE)
-    try:
-        style["text_size"] = int(settings.value("annotations/text_size", style["text_size"]))
-    except (TypeError, ValueError):
-        pass
-    for key in ("text_color", "line_color", "highlight_color", "note_color"):
-        color = QColor(str(settings.value(f"annotations/{key}", "")))
-        if color.isValid():
-            style[key] = color
-    return style
-
-
-class ColorButton(QPushButton):
-    """Shows a color; clicking it picks another one."""
-
-    def __init__(self, color, title, parent=None):
-        super().__init__(parent)
-        self.title = title
-        self.set_color(color)
-        self.clicked.connect(self._pick)
-
-    def set_color(self, color):
-        self.color = QColor(color)
-        swatch = QPixmap(40, 14)
-        swatch.fill(self.color)
-        self.setIcon(QIcon(swatch))
-        self.setIconSize(swatch.size())
-        self.setText(self.color.name())
-
-    def _pick(self):
-        color = QColorDialog.getColor(self.color, self, self.title)
-        if color.isValid():
-            self.set_color(color)
-
-
-class SettingsDialog(QDialog):
-    """How new annotations look: text size and color, strikethrough /
-    underline color, highlight and note colors."""
-
-    COLORS = (("text_color", "Font color"), ("line_color", "Line color (strikethrough, underline)"),
-              ("highlight_color", "Highlight color"), ("note_color", "Note color"))
-
-    def __init__(self, style, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("nerdpdf settings")
-        form = QFormLayout(self)
-        self.text_size = QSpinBox(minimum=4, maximum=72, suffix=" pt", value=style["text_size"])
-        form.addRow("Font size", self.text_size)
-        self.buttons = {}
-        for key, label in self.COLORS:
-            self.buttons[key] = ColorButton(style[key], label, self)
-            form.addRow(label, self.buttons[key])
-        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        box.accepted.connect(self.accept)
-        box.rejected.connect(self.reject)
-        form.addRow(box)
-
-    def values(self):
-        return {"text_size": self.text_size.value(), **{k: b.color for k, b in self.buttons.items()}}
 
 
 class SearchLine(QLineEdit):
@@ -189,12 +135,9 @@ class MainWindow(QMainWindow):
             self.settings.setValue(self._pos_key(self.path), [page, py])
 
     def open(self, path):
-        try:
-            doc = _load(path)
-        except Exception as e:
-            QMessageBox.warning(self, "nerdpdf", f"Cannot open {path}:\n{e}")
-            return
-        self._show(path, doc)
+        doc = _load_or_warn(path, self)
+        if doc:
+            self._show(path, doc)
 
     def _show(self, path, doc):
         self.flush_edits()
@@ -202,10 +145,7 @@ class MainWindow(QMainWindow):
         self._remember_zoom()
         self.path = path
         self.hide_search()
-        if is_image(doc) or looks_like_slides(doc):
-            self.view.zoom, self.view.fit_mode = self.zoom_pref[0], "page"
-        else:
-            self.view.zoom, self.view.fit_mode = self.zoom_pref
+        self.view.zoom, self.view.fit_mode = self.zoom_pref  # slides and images override this with fit page
         self.view.set_document(doc)
         pos = None if self.view.is_image else self.settings.value(self._pos_key(path))
         if pos:
@@ -229,7 +169,7 @@ class MainWindow(QMainWindow):
                 doc = _load(path)
             except Exception:
                 doc = None
-            if doc and is_image(doc):
+            if doc and is_image_doc(doc):
                 self._show(path, doc)
                 if delta < 0:  # coming back into a multi-page image (TIFF) lands on its last page
                     self.view.goto_page(len(doc) - 1)
@@ -242,7 +182,7 @@ class MainWindow(QMainWindow):
 
     def flush_edits(self):
         """Write pending annotation changes now (also before closing or opening another file)."""
-        self.view.finish_editing()
+        self.view.finish_text()
         self._save_timer.stop()
         if self._edits_pending:
             self._edits_pending = False
@@ -257,9 +197,7 @@ class MainWindow(QMainWindow):
             else:  # e.g. a repaired file: rewrite it whole and reopen it
                 doc.save(tmp, garbage=1)
                 os.replace(tmp, doc.name)
-                pos = self.view.position()
-                self.view.set_document(_load(doc.name))
-                self.view.set_position(*pos)
+                self.view.reload_document(_load(doc.name))
         except Exception as e:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -323,7 +261,7 @@ class MainWindow(QMainWindow):
         style = dlg.values()
         for key, value in style.items():
             self.settings.setValue(f"annotations/{key}", value.name() if isinstance(value, QColor) else value)
-        for win in getattr(QApplication.instance(), "windows", [self]):
+        for win in QApplication.instance().windows:
             win.view.annot_style = dict(style)
 
     def toggle_fullscreen(self):
@@ -367,9 +305,10 @@ KEYS = """keys:
   j k / h l        scroll down / up / left / right
   J K, n p         next / previous page (n N: next / previous match while searching)
   Space Backspace  next / previous page
-  gg G             first / last page (12G: page 12)
+  PgDn PgUp        scroll one screen
+  gg G, Home End   first / last page (12G: page 12)
   a s              fit width / fit page
-  = -              zoom in / out (also right button+wheel, Shift/Cmd+wheel, pinch)
+  = (+) -          zoom in / out (also right button+wheel, Shift/Cmd+wheel, pinch)
   /                search (Enter to find, Esc to close; not for images)
   d                single page / continuous feed
   f F              toggle fullscreen (Esc leaves)
@@ -390,22 +329,18 @@ def parse_args(argv):
     parser.add_argument("-v", "--version", action="version", version=f"nerdpdf {__version__}")
     parser.add_argument("--install-app", nargs="?", const="~/Applications", metavar="DIR",
                         help="install nerdpdf.app into DIR (default: ~/Applications) and exit; macOS only")
-    # older macOS passes -psn_* when launching from Finder
-    return parser.parse_args([a for a in argv if not a.startswith("-psn_")])
+    return parser.parse_args(argv)
 
 
 class Application(QApplication):
-    fileOpened = Signal(str)  # macOS Finder "Open With" / dropping on the Dock icon
-
     def __init__(self, argv):
         super().__init__(argv)
         self.windows = []
-        self.fileOpened.connect(self.open_file)
         self.aboutToQuit.connect(lambda: [w.flush_edits() for w in self.windows])
 
     def event(self, ev):
-        if ev.type() == QEvent.FileOpen:
-            self.fileOpened.emit(ev.file())
+        if ev.type() == QEvent.FileOpen:  # macOS Finder "Open With" / dropping on the Dock icon
+            self.open_file(ev.file())
             return True
         return super().event(ev)
 
@@ -432,10 +367,8 @@ class Application(QApplication):
         if empty:
             empty.open(path)
             return
-        try:
-            doc = _load(path)
-        except Exception as e:
-            QMessageBox.warning(self.activeWindow(), "nerdpdf", f"Cannot open {path}:\n{e}")
+        doc = _load_or_warn(path, self.activeWindow())
+        if not doc:
             return
         win = self.new_window()
         # show after the window is laid out so fit-width/position use the real viewport size

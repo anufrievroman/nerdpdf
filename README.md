@@ -28,10 +28,10 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `J` / `K`, `n` / `p` | next / previous page (`n` steps through matches while a search is open) |
 | `Space` / `Backspace` (`Shift+Space`) | next / previous page |
 | PgDn / PgUp | scroll one screen |
-| `gg` / `G` | first / last page; `12G` or `12gg` goes to page 12 |
+| `gg` / `G`, Home / End | first / last page; `12G` or `12gg` goes to page 12 |
 | `a` / `s` | fit width / fit page |
 | `d` | toggle single-page mode (one page on screen) / continuous feed |
-| `=` / `-` | zoom in / out |
+| `=` (`+`) / `-` | zoom in / out |
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
 | right-click | PDFs: add a note or text there, or highlight / strike through / underline / copy text; on an existing one: edit / delete; Settings |
