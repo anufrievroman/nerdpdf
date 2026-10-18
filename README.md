@@ -2,7 +2,7 @@
 
 # nerdpdf
 
-Minimal keyboard-driven PDF viewer (PyMuPDF + Qt/PySide6).
+Minimal keyboard-driven PDF and image viewer (PyMuPDF + Qt/PySide6).
 
 ## Installation
 
@@ -15,6 +15,7 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 ## Usage
 
     nerdpdf file.pdf
+    nerdpdf picture.png
     nerdpdf -h        # options and keys
     nerdpdf -v        # version
 
@@ -32,7 +33,7 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `d` | toggle single-page mode (one page on screen) / continuous feed |
 | `=` / `-` | zoom in / out |
 | middle-button drag | pan the document |
-| Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
+| right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
 | `/` | search: Enter finds, then `n` / `N` = next / previous match, Esc = close |
 | `f` / `F` | toggle fullscreen; `Esc` leaves it (after closing search, if open) |
 | `o` | open file (drag & drop works too) |
@@ -41,6 +42,11 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 Slide decks (first page 4:3, 16:10 or 16:9 landscape) open in single-page mode, fitted to
 the page, without changing the zoom remembered for regular documents. In single-page mode
 the wheel flips pages once you scroll past the page edge.
+
+Images (PNG, JPEG, GIF, BMP, TIFF, ...) open the same way, fitted to the window but never
+enlarged beyond their natural size. Zoom and panning work as usual; search and `d` are off.
+Next / previous page (`J` `K`, `Space`, ...) and the wheel (even when zoomed in) step through
+the other images in the same folder (not subfolders), in natural name order.
 
 Counts work like vim: `5j`, `3J`.
 

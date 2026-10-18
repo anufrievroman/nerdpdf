@@ -7,7 +7,7 @@ from time import monotonic
 
 import pymupdf
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPalette
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QImageReader, QPainter, QPalette
 from PySide6.QtWidgets import QAbstractScrollArea
 
 GAP = 12  # px between pages and around the document
@@ -30,6 +30,20 @@ def _to_qimage(pix, dpr):
     return img
 
 
+def is_image(doc):
+    """True for a picture file (PNG, JPEG, ...) that PyMuPDF opened as a document."""
+    return doc.metadata.get("format") == "Image"
+
+
+def _natural_zoom(doc):
+    """Zoom at which one image pixel takes one logical screen pixel."""
+    w, h = doc[0].rect.width, doc[0].rect.height
+    size = QImageReader(doc.name).size() if doc.name else None
+    if size is None or not size.isValid() or not w or not h:
+        return 96 / 72  # PyMuPDF's size for images without resolution info
+    return max(size.width(), size.height()) / max(w, h)  # max() ignores EXIF rotation
+
+
 def looks_like_slides(doc):
     """True if the first page has a landscape 4:3, 16:10 or 16:9 shape."""
     if not len(doc):
@@ -45,6 +59,7 @@ class PdfView(QAbstractScrollArea):
     escapePressed = Signal()
     fullscreenRequested = Signal()
     openRequested = Signal()
+    fileStep = Signal(int)  # images: paging past the first/last page moves this many files in the folder
     quitRequested = Signal()
 
     def __init__(self, parent=None):
@@ -55,7 +70,9 @@ class PdfView(QAbstractScrollArea):
         self.doc_w = self.doc_h = 0.0
         self.zoom = 1.0
         self.fit_mode = "width"  # "width", "page" or None (free zoom)
-        self.presentation = False  # slide deck: opens fitted to the page, one page at a time
+        self.presentation = False  # slide deck or image: opens fitted to the page, one page at a time
+        self.is_image = False
+        self.fit_cap = None  # images: fit page never enlarges beyond their natural size
         self.single_page = False  # show only self.page instead of the continuous feed
         self.page = 0  # the page shown in single-page mode
 
@@ -68,6 +85,7 @@ class PdfView(QAbstractScrollArea):
         self._count = ""  # vim count prefix
         self._g_pending = False
         self._drag_from = None  # last mouse position while middle-button panning
+        self._right_down = False  # right button held: the wheel zooms
         self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
         self._last_flip = 0.0
 
@@ -90,7 +108,9 @@ class PdfView(QAbstractScrollArea):
         self._cache_bytes = 0
         self._clips.clear()
         self.clear_search()
-        self.presentation = looks_like_slides(doc)
+        self.is_image = is_image(doc)
+        self.fit_cap = _natural_zoom(doc) if self.is_image else None
+        self.presentation = self.is_image or looks_like_slides(doc)
         self.single_page = self.presentation
         self.page = 0
         if self.fit_mode:
@@ -117,8 +137,8 @@ class PdfView(QAbstractScrollArea):
         self.verticalScrollBar().setValue(round(self.tops[page] + py * self.zoom))
 
     def toggle_single_page(self):
-        """Switch between the continuous feed and showing one page at a time."""
-        if not self.sizes:
+        """Switch between the continuous feed and showing one page at a time (not for images)."""
+        if not self.sizes or self.is_image:
             return
         i = self.current_page()
         top, py = self.position()
@@ -209,6 +229,8 @@ class PdfView(QAbstractScrollArea):
             z = (vp.width() - 2 * GAP) / w
         else:
             z = min((vp.height() - 2 * GAP) / h, (vp.width() - 2 * GAP) / w)
+            if self.fit_cap:
+                z = min(z, self.fit_cap)
         return max(MIN_ZOOM, min(MAX_ZOOM, z))
 
     def set_zoom(self, zoom, anchor=None, fit_mode=None):
@@ -293,6 +315,9 @@ class PdfView(QAbstractScrollArea):
             self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def next_page(self, n=1):
+        if self.is_image and self.page + n >= len(self.sizes):
+            self.fileStep.emit(n)
+            return
         if self.single_page:
             self._show_page(self.page + n)
             return
@@ -306,6 +331,9 @@ class PdfView(QAbstractScrollArea):
         self.verticalScrollBar().setValue(round(y))
 
     def prev_page(self, n=1, at_bottom=False):
+        if self.is_image and self.page - n < 0:
+            self.fileStep.emit(-n)
+            return
         if self.single_page:
             self._show_page(self.page - n, at_bottom)
             return
@@ -502,7 +530,7 @@ class PdfView(QAbstractScrollArea):
             self._relayout()
 
     def wheelEvent(self, ev):
-        if ev.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
+        if self._right_down or ev.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
             d = ev.angleDelta()
             delta = d.y() or d.x()  # macOS turns shift+wheel into horizontal scroll
             if delta:
@@ -516,10 +544,15 @@ class PdfView(QAbstractScrollArea):
         super().wheelEvent(ev)
 
     def _wheel_flip(self, ev):
-        """Single-page mode: scrolling past the page edge flips to the next/previous page."""
+        """Single-page mode: scrolling past the page edge flips to the next/previous page.
+
+        Images flip right away, even when zoomed in.
+        """
         dy = ev.angleDelta().y()
+        if not dy:
+            return False
         vbar = self.verticalScrollBar()
-        if not dy or (dy < 0 and vbar.value() < vbar.maximum()) or (dy > 0 and vbar.value() > 0):
+        if not self.is_image and ((dy < 0 and vbar.value() < vbar.maximum()) or (dy > 0 and vbar.value() > 0)):
             return False  # still room to scroll within the page
         if ev.phase() == Qt.ScrollMomentum or monotonic() - self._last_flip < WHEEL_FLIP_PAUSE:
             return True  # trackpad inertia / a burst of wheel clicks should not fly through pages
@@ -533,6 +566,10 @@ class PdfView(QAbstractScrollArea):
         return True
 
     def mousePressEvent(self, ev):
+        if ev.button() == Qt.RightButton:
+            self._right_down = True
+            ev.accept()
+            return
         if ev.button() == Qt.MiddleButton:
             self._drag_from = ev.position()
             self.viewport().setCursor(Qt.ClosedHandCursor)
@@ -550,6 +587,10 @@ class PdfView(QAbstractScrollArea):
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.RightButton:
+            self._right_down = False
+            ev.accept()
+            return
         if ev.button() == Qt.MiddleButton and self._drag_from is not None:
             self._drag_from = None
             self.viewport().unsetCursor()
@@ -621,7 +662,8 @@ class PdfView(QAbstractScrollArea):
         elif t == "-":
             self.zoom_by(ZOOM_STEP ** -n)
         elif t == "/":
-            self.searchRequested.emit()
+            if not self.is_image:
+                self.searchRequested.emit()
         elif key == Qt.Key_Escape:
             self.escapePressed.emit()
         elif t in ("f", "F"):

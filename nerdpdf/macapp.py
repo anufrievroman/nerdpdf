@@ -34,6 +34,12 @@ def _info_plist():
             "CFBundleTypeRole": "Viewer",
             "LSHandlerRank": "Alternate",
             "LSItemContentTypes": ["com.adobe.pdf"],
+        }, {
+            "CFBundleTypeName": "Image",
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate",
+            "LSItemContentTypes": ["public.png", "public.jpeg", "com.compuserve.gif",
+                                   "com.microsoft.bmp", "public.tiff"],
         }],
     }
 

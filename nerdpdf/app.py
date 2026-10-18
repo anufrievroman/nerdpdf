@@ -3,7 +3,9 @@
 import argparse
 import hashlib
 import os
+import re
 import sys
+from bisect import bisect_left
 
 import pymupdf
 from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, Signal
@@ -12,7 +14,36 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, Q
                                QMainWindow, QMessageBox, QVBoxLayout, QWidget)
 
 from . import __version__
-from .view import PdfView, looks_like_slides
+from .view import PdfView, is_image, looks_like_slides
+
+
+DOC_TYPES = "*.pdf *.epub *.xps *.cbz"
+IMAGE_TYPES = "*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.pnm *.pbm *.pgm *.ppm *.psd *.jxr"
+IMAGE_EXTS = {t[1:] for t in IMAGE_TYPES.split()}
+
+
+def _natural_key(name):
+    """Sort key putting img2 before img10, ignoring case."""
+    return [(0, int(s), "") if s.isdigit() else (1, 0, s) for s in re.split(r"(\d+)", name.lower())]
+
+
+def _load(path):
+    """Open a document, failing here (not on first paint) when its first page can't be read."""
+    doc = pymupdf.open(path)
+    if len(doc):
+        doc.load_page(0)
+    return doc
+
+
+def _folder_images(directory):
+    """Image files directly in directory (not recursive), in natural order."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    names = [n for n in names if not n.startswith(".") and os.path.splitext(n)[1].lower() in IMAGE_EXTS
+             and os.path.isfile(os.path.join(directory, n))]
+    return sorted(names, key=_natural_key)
 
 
 class SearchLine(QLineEdit):
@@ -33,6 +64,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings("nerdpdf", "nerdpdf")
         self.path = None
+        self._title_dir, self._title_names = None, []  # folder listing cached for the window title
 
         self.view = PdfView()
         # remembered zoom for regular documents; slides always open fitted to the page
@@ -60,6 +92,7 @@ class MainWindow(QMainWindow):
         self.view.stateChanged.connect(self._update_title)
         self.view.searchRequested.connect(self.show_search)
         self.view.openRequested.connect(self.open_dialog)
+        self.view.fileStep.connect(self.step_image)
         self.view.quitRequested.connect(self.close)
         self.view.searchStep.connect(lambda forward: self._search(self.search_line.text(), forward))
         self.view.escapePressed.connect(self._escape)
@@ -79,29 +112,56 @@ class MainWindow(QMainWindow):
         return "positions/" + hashlib.sha1(os.path.abspath(path).encode()).hexdigest()
 
     def _save_position(self):
-        if self.path and self.view.page_count():
+        if self.path and self.view.page_count() and not self.view.is_image:
             page, py = self.view.position()
             self.settings.setValue(self._pos_key(self.path), [page, py])
 
     def open(self, path):
         try:
-            doc = pymupdf.open(path)
+            doc = _load(path)
         except Exception as e:
             QMessageBox.warning(self, "nerdpdf", f"Cannot open {path}:\n{e}")
             return
+        self._show(path, doc)
+
+    def _show(self, path, doc):
         self._save_position()
         self._remember_zoom()
         self.path = path
         self.hide_search()
-        if looks_like_slides(doc):
+        if is_image(doc) or looks_like_slides(doc):
             self.view.zoom, self.view.fit_mode = self.zoom_pref[0], "page"
         else:
             self.view.zoom, self.view.fit_mode = self.zoom_pref
         self.view.set_document(doc)
-        pos = self.settings.value(self._pos_key(path))
+        pos = None if self.view.is_image else self.settings.value(self._pos_key(path))
         if pos:
             self.view.set_position(int(pos[0]), float(pos[1]))
         self._update_title()
+
+    def step_image(self, delta):
+        """Open the image delta files away in the current image's folder, skipping unreadable ones."""
+        directory, name = os.path.split(os.path.abspath(self.path))
+        names = _folder_images(directory)
+        keys = [_natural_key(n) for n in names]
+        i = bisect_left(keys, _natural_key(name))
+        if i < len(names) and names[i] == name:
+            i += delta
+        else:  # the current file is gone; i is already the next one
+            i += delta - 1 if delta > 0 else delta
+        step = 1 if delta > 0 else -1
+        while 0 <= i < len(names):
+            path = os.path.join(directory, names[i])
+            try:
+                doc = _load(path)
+            except Exception:
+                doc = None
+            if doc and is_image(doc):
+                self._show(path, doc)
+                if delta < 0:  # coming back into a multi-page image (TIFF) lands on its last page
+                    self.view.goto_page(len(doc) - 1)
+                return
+            i += step
 
     def _remember_zoom(self):
         if self.path and not self.view.presentation:
@@ -109,7 +169,8 @@ class MainWindow(QMainWindow):
 
     def open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", os.path.dirname(self.path or ""),
-                                              "Documents (*.pdf *.epub *.xps *.cbz);;All files (*)")
+                                              f"Documents and images ({DOC_TYPES} {IMAGE_TYPES});;"
+                                              f"Documents ({DOC_TYPES});;Images ({IMAGE_TYPES});;All files (*)")
         if path:
             self.open(path)
 
@@ -166,9 +227,19 @@ class MainWindow(QMainWindow):
         if not self.path:
             self.setWindowTitle("nerdpdf")
             return
-        name = os.path.basename(self.path)
+        directory, name = os.path.split(os.path.abspath(self.path))
+        zoom = f"{self.view.zoom * 100:.0f}%"
         n = self.view.page_count()
-        self.setWindowTitle(f"{name} — {self.view.current_page() + 1}/{n} — {self.view.zoom * 100:.0f}%")
+        page = f"{self.view.current_page() + 1}/{n}"
+        if self.view.is_image:
+            if self._title_dir != directory or name not in self._title_names:
+                self._title_dir, self._title_names = directory, _folder_images(directory)
+            place = (f"{self._title_names.index(name) + 1}/{len(self._title_names)}"
+                     if name in self._title_names else "")
+            parts = [name, place, f"page {page}" if n > 1 else "", zoom]
+            self.setWindowTitle(" — ".join(p for p in parts if p))
+            return
+        self.setWindowTitle(f"{name} — {page} — {zoom}")
 
     def closeEvent(self, ev):
         self._save_position()
@@ -185,8 +256,8 @@ KEYS = """keys:
   Space Backspace  next / previous page
   gg G             first / last page (12G: page 12)
   a s              fit width / fit page
-  = -              zoom in / out (also Shift/Cmd+wheel, pinch)
-  /                search (Enter to find, Esc to close)
+  = -              zoom in / out (also right button+wheel, Shift/Cmd+wheel, pinch)
+  /                search (Enter to find, Esc to close; not for images)
   d                single page / continuous feed
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
@@ -197,7 +268,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="nerdpdf", description="Minimal keyboard-driven PDF viewer.",
         epilog=KEYS, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("file", nargs="?", help="document to open (PDF, EPUB, XPS, CBZ)")
+    parser.add_argument("file", nargs="?", help="document or image to open (PDF, EPUB, XPS, CBZ, PNG, JPEG, ...)")
     parser.add_argument("-v", "--version", action="version", version=f"nerdpdf {__version__}")
     parser.add_argument("--install-app", nargs="?", const="~/Applications", metavar="DIR",
                         help="install nerdpdf.app into DIR (default: ~/Applications) and exit; macOS only")
