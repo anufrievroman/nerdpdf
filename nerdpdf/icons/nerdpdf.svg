@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0A84FF"/><stop offset="1" stop-color="#5E5CE6"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="110" width="824" height="824" rx="185" fill="#000" opacity="0.2"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <rect x="134" y="134" width="756" height="756" rx="155" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="6"/>
+  <g fill="#FFFFFF" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+    <text x="200" y="290" font-size="110" font-weight="500">v1</text>
+    <text x="512" y="650" font-size="360" font-weight="700" text-anchor="middle"
+          letter-spacing="-8">Pdf</text>
+    <text x="512" y="790" font-size="104" font-weight="400" text-anchor="middle"
+          fill-opacity="0.9">Nerd</text>
+  </g>
+</svg>

@@ -1,14 +1,17 @@
 """Main window: PDF view, search bar and persisted settings."""
 
+import argparse
 import hashlib
 import os
 import sys
 
 import pymupdf
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QVBoxLayout, QWidget)
 
+from . import __version__
 from .view import PdfView, looks_like_slides
 
 
@@ -176,12 +179,59 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
+KEYS = """keys:
+  j k / h l        scroll down / up / left / right
+  J K, n p         next / previous page (n N: next / previous match while searching)
+  Space Backspace  next / previous page
+  gg G             first / last page (12G: page 12)
+  a s              fit width / fit page
+  = -              zoom in / out (also Shift/Cmd+wheel, pinch)
+  /                search (Enter to find, Esc to close)
+  d                single page / continuous feed
+  f F              toggle fullscreen (Esc leaves)
+  o q              open file / quit
+  middle-drag      pan"""
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="nerdpdf", description="Minimal keyboard-driven PDF viewer.",
+        epilog=KEYS, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("file", nargs="?", help="document to open (PDF, EPUB, XPS, CBZ)")
+    parser.add_argument("-v", "--version", action="version", version=f"nerdpdf {__version__}")
+    parser.add_argument("--install-app", nargs="?", const="~/Applications", metavar="DIR",
+                        help="install nerdpdf.app into DIR (default: ~/Applications) and exit; macOS only")
+    # older macOS passes -psn_* when launching from Finder
+    return parser.parse_args([a for a in argv if not a.startswith("-psn_")])
+
+
+class Application(QApplication):
+    fileOpened = Signal(str)  # macOS Finder "Open With" / dropping on the Dock icon
+
+    def event(self, ev):
+        if ev.type() == QEvent.FileOpen:
+            self.fileOpened.emit(ev.file())
+            return True
+        return super().event(ev)
+
+
 def main():
-    app = QApplication(sys.argv)
+    args = parse_args(sys.argv[1:])
+    if args.install_app:
+        from .macapp import install_app
+        install_app(args.install_app)
+        return
+
+    app = Application(sys.argv[:1])
     app.setApplicationName("nerdpdf")
+    app.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "icons", "nerdpdf.png")))
     win = MainWindow()
     win.show()
-    args = app.arguments()[1:]
-    # open after the window is laid out so fit-width/position use the real viewport size
-    QTimer.singleShot(0, lambda: win.open(args[0]) if args else win.open_dialog())
+    app.fileOpened.connect(win.open)
+    if args.file:
+        # open after the window is laid out so fit-width/position use the real viewport size
+        QTimer.singleShot(0, lambda: win.open(args.file))
+    else:
+        # give a Finder file-open event a moment to arrive before asking for a file
+        QTimer.singleShot(300, lambda: win.path or win.open_dialog())
     sys.exit(app.exec())

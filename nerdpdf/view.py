@@ -1,8 +1,9 @@
-"""Continuous-scroll PDF page view rendered with PyMuPDF."""
+"""PDF page view (continuous feed or one page at a time) rendered with PyMuPDF."""
 
 from bisect import bisect_right
 from collections import OrderedDict
 from math import ceil
+from time import monotonic
 
 import pymupdf
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
@@ -13,6 +14,7 @@ GAP = 12  # px between pages and around the document
 MIN_ZOOM, MAX_ZOOM = 0.1, 12.0
 ZOOM_STEP = 1.2
 LINE_STEP = 60  # px per j/k press
+WHEEL_FLIP_PAUSE = 0.35  # s between wheel page flips in single-page mode
 FULL_RENDER_LIMIT = 24_000_000  # device px; bigger pages render only their visible part
 CACHE_BYTES = 256 * 1024 * 1024
 
@@ -53,7 +55,9 @@ class PdfView(QAbstractScrollArea):
         self.doc_w = self.doc_h = 0.0
         self.zoom = 1.0
         self.fit_mode = "width"  # "width", "page" or None (free zoom)
-        self.presentation = False  # slides: space/backspace flip pages
+        self.presentation = False  # slide deck: opens fitted to the page, one page at a time
+        self.single_page = False  # show only self.page instead of the continuous feed
+        self.page = 0  # the page shown in single-page mode
 
         self._cache = OrderedDict()  # page -> (scale, QImage) full-page renders
         self._cache_bytes = 0
@@ -64,6 +68,8 @@ class PdfView(QAbstractScrollArea):
         self._count = ""  # vim count prefix
         self._g_pending = False
         self._drag_from = None  # last mouse position while middle-button panning
+        self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
+        self._last_flip = 0.0
 
         self._render_timer = QTimer(self, singleShot=True, interval=90)
         self._render_timer.timeout.connect(self._render_visible)
@@ -85,6 +91,8 @@ class PdfView(QAbstractScrollArea):
         self._clips.clear()
         self.clear_search()
         self.presentation = looks_like_slides(doc)
+        self.single_page = self.presentation
+        self.page = 0
         if self.fit_mode:
             self.zoom = self._fit_zoom(0, self.fit_mode)
         self._relayout()
@@ -98,25 +106,52 @@ class PdfView(QAbstractScrollArea):
     def position(self):
         """(page, y in points) at the top of the viewport, for restoring later."""
         i, _, py = self._locate(QPointF(0, 0))
-        return i, py
+        return i, max(py, -GAP / self.zoom)  # ignore the centring margin of single-page mode
 
     def set_position(self, page, py):
         if not self.sizes:
             return
         page = max(0, min(page, len(self.sizes) - 1))
+        if self.single_page:
+            self._show_page(page)
         self.verticalScrollBar().setValue(round(self.tops[page] + py * self.zoom))
+
+    def toggle_single_page(self):
+        """Switch between the continuous feed and showing one page at a time."""
+        if not self.sizes:
+            return
+        i = self.current_page()
+        top, py = self.position()
+        if top != i:  # the page above only peeks in at the top; start at the centre page's top
+            py = -GAP / self.zoom
+        self.single_page = not self.single_page
+        self.page = i
+        if self.fit_mode:
+            self.zoom = self._fit_zoom(i, self.fit_mode)
+        self._relayout()
+        self.set_position(i, py)
+        self.viewport().update()
+        self.stateChanged.emit()
 
     # ------------------------------------------------------------------ layout
 
     def _relayout(self):
         z = self.zoom
-        y = GAP
-        self.tops = []
-        for _, h in self.sizes:
-            self.tops.append(y)
-            y += h * z + GAP
-        self.doc_h = y
-        self.doc_w = max((w for w, _ in self.sizes), default=0) * z + 2 * GAP
+        if self.single_page and self.sizes:
+            # every page sits at the same spot (centred vertically when it is shorter than the
+            # viewport); only self.page is ever shown
+            w, h = self.sizes[self.page]
+            self.doc_h = h * z + 2 * GAP
+            self.tops = [GAP + max(0.0, (self.viewport().height() - self.doc_h) / 2)] * len(self.sizes)
+            self.doc_w = w * z + 2 * GAP
+        else:
+            y = GAP
+            self.tops = []
+            for _, h in self.sizes:
+                self.tops.append(y)
+                y += h * z + GAP
+            self.doc_h = y
+            self.doc_w = max((w for w, _ in self.sizes), default=0) * z + 2 * GAP
         vw, vh = self.viewport().width(), self.viewport().height()
         hbar, vbar = self.horizontalScrollBar(), self.verticalScrollBar()
         hbar.setRange(0, max(0, ceil(self.doc_w - vw)))
@@ -142,16 +177,23 @@ class PdfView(QAbstractScrollArea):
             return 0, 0.0, 0.0
         cy = self.verticalScrollBar().value() + pt.y()
         cx = self.horizontalScrollBar().value() + pt.x()
-        i = max(0, min(bisect_right(self.tops, cy) - 1, len(self.sizes) - 1))
+        if self.single_page:
+            i = self.page
+        else:
+            i = max(0, min(bisect_right(self.tops, cy) - 1, len(self.sizes) - 1))
         return i, (cx - self._page_x(i)) / self.zoom, (cy - self.tops[i]) / self.zoom
 
     def current_page(self):
+        if self.single_page:
+            return self.page
         vp = self.viewport().rect()
         return self._locate(QPointF(vp.width() / 2, vp.height() / 2))[0]
 
     def _visible_pages(self):
         if not self.sizes:
             return range(0)
+        if self.single_page:
+            return range(self.page, self.page + 1)
         top = self.verticalScrollBar().value()
         bottom = top + self.viewport().height()
         first = max(0, bisect_right(self.tops, top) - 1)
@@ -213,12 +255,47 @@ class PdfView(QAbstractScrollArea):
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + dx)
         self.verticalScrollBar().setValue(self.verticalScrollBar().value() + dy)
 
+    def _show_page(self, i, at_bottom=False):
+        """Single-page mode: switch to page i, re-fitting it if a fit mode is on."""
+        self.page = max(0, min(i, len(self.sizes) - 1))
+        if self.fit_mode:
+            self.zoom = self._fit_zoom(self.page, self.fit_mode)
+        self._relayout()
+        vbar = self.verticalScrollBar()
+        vbar.setValue(vbar.maximum() if at_bottom else 0)
+        self.viewport().update()
+        self.stateChanged.emit()
+        QTimer.singleShot(0, lambda: self._prefetch(self.page + 1))
+
+    def _prefetch(self, i):
+        """Render page i ahead of time so flipping to it is instant."""
+        if not self.single_page or not 0 <= i < len(self.sizes):
+            return
+        dpr = self.viewport().devicePixelRatioF()
+        scale = self._fit_zoom(i, self.fit_mode) * dpr if self.fit_mode else self.zoom * dpr
+        w, h = self.sizes[i]
+        if w * h * scale * scale <= FULL_RENDER_LIMIT and self._cache.get(i, (None,))[0] != scale:
+            self._render_full(i, scale, dpr)
+
     def goto_page(self, i):
-        if self.sizes:
-            i = max(0, min(i, len(self.sizes) - 1))
+        if not self.sizes:
+            return
+        i = max(0, min(i, len(self.sizes) - 1))
+        if self.single_page:
+            self._show_page(i)
+        else:
             self.verticalScrollBar().setValue(round(self.tops[i] - GAP))
 
+    def goto_last(self):
+        if self.single_page:
+            self.goto_page(len(self.sizes) - 1)
+        else:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
     def next_page(self, n=1):
+        if self.single_page:
+            self._show_page(self.page + n)
+            return
         y = self.verticalScrollBar().value()
         for _ in range(n):
             i = bisect_right(self.tops, y + GAP + 1)
@@ -228,7 +305,10 @@ class PdfView(QAbstractScrollArea):
             y = self.tops[i] - GAP
         self.verticalScrollBar().setValue(round(y))
 
-    def prev_page(self, n=1):
+    def prev_page(self, n=1, at_bottom=False):
+        if self.single_page:
+            self._show_page(self.page - n, at_bottom)
+            return
         y = self.verticalScrollBar().value()
         for _ in range(n):
             i = bisect_right(self.tops, y + GAP - 1) - 1
@@ -281,6 +361,8 @@ class PdfView(QAbstractScrollArea):
                 cand = idx
             if 0 <= cand < len(hits):
                 self._current_hit = (pg, cand)
+                if self.single_page and pg != self.page:
+                    self._show_page(pg)
                 self._reveal(pg, hits[cand])
                 self.viewport().update()
                 return pg, cand, len(hits)
@@ -427,7 +509,28 @@ class PdfView(QAbstractScrollArea):
                 self.zoom_by(1.0015 ** delta, ev.position())
             ev.accept()
             return
+        if self.single_page and self._wheel_flip(ev):
+            ev.accept()
+            return
+        self._wheel_acc = 0
         super().wheelEvent(ev)
+
+    def _wheel_flip(self, ev):
+        """Single-page mode: scrolling past the page edge flips to the next/previous page."""
+        dy = ev.angleDelta().y()
+        vbar = self.verticalScrollBar()
+        if not dy or (dy < 0 and vbar.value() < vbar.maximum()) or (dy > 0 and vbar.value() > 0):
+            return False  # still room to scroll within the page
+        if ev.phase() == Qt.ScrollMomentum or monotonic() - self._last_flip < WHEEL_FLIP_PAUSE:
+            return True  # trackpad inertia / a burst of wheel clicks should not fly through pages
+        if (self._wheel_acc < 0) != (dy < 0):
+            self._wheel_acc = 0
+        self._wheel_acc += dy
+        if abs(self._wheel_acc) >= 120:
+            self.next_page() if self._wheel_acc < 0 else self.prev_page(at_bottom=True)
+            self._wheel_acc = 0
+            self._last_flip = monotonic()
+        return True
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MiddleButton:
@@ -472,7 +575,7 @@ class PdfView(QAbstractScrollArea):
         if self._g_pending:
             self._g_pending = False
             if t == "g":
-                self.goto_page(count - 1) if count else self.verticalScrollBar().setValue(0)
+                self.goto_page(count - 1 if count else 0)
                 return
         vh = self.viewport().height()
 
@@ -491,23 +594,24 @@ class PdfView(QAbstractScrollArea):
             self.next_page(n)
         elif t in ("K", "p"):
             self.prev_page(n)
-        elif key == Qt.Key_Space and self.presentation:
+        elif key == Qt.Key_Space:
             self.prev_page(n) if ev.modifiers() & Qt.ShiftModifier else self.next_page(n)
-        elif key == Qt.Key_Backspace and self.presentation:
+        elif key == Qt.Key_Backspace:
             self.prev_page(n)
-        elif key in (Qt.Key_PageDown, Qt.Key_Space) and not ev.modifiers() & Qt.ShiftModifier:
+        elif key == Qt.Key_PageDown:
             self.scroll_by(0, int(vh * 0.9))
-        elif key in (Qt.Key_PageUp, Qt.Key_Space, Qt.Key_Backspace):
+        elif key == Qt.Key_PageUp:
             self.scroll_by(0, -int(vh * 0.9))
         elif t == "g":
             self._g_pending = True
         elif t == "G":
-            self.goto_page(count - 1) if count else self.verticalScrollBar().setValue(
-                self.verticalScrollBar().maximum())
+            self.goto_page(count - 1) if count else self.goto_last()
         elif key == Qt.Key_Home:
-            self.verticalScrollBar().setValue(0)
+            self.goto_page(0)
         elif key == Qt.Key_End:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+            self.goto_last()
+        elif t == "d":
+            self.toggle_single_page()
         elif t == "a":
             self.fit_width()
         elif t == "s":
