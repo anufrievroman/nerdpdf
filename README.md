@@ -34,6 +34,10 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `=` / `-` | zoom in / out |
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
+| right-click | PDFs: add a note or text there; on an existing one: edit / delete |
+| left-drag on a note or text | move it |
+| double-click on a note or text | edit it |
+| hover over a note | show its text |
 | `/` | search: Enter finds, then `n` / `N` = next / previous match, Esc = close |
 | `f` / `F` | toggle fullscreen; `Esc` leaves it (after closing search, if open) |
 | `o` | open file (drag & drop works too) |
@@ -50,6 +54,13 @@ the other images in the same folder (not subfolders), in natural name order.
 
 On macOS, files opened from Finder or dropped on the Dock icon open in a new window
 (`o` and dropping onto a window replace its document).
+
+Right-click on a PDF page to add a sticky note (its text is entered in a dialog) or blue or
+black, small (8pt) or large (12pt) text (typed in place). In both, Enter or Esc (as in vim)
+saves the text, Shift+Enter starts a new line, and saving it empty removes the note or text.
+Drag a note or text with the left button to move it, double-click it to edit it; hovering over
+a note shows its text. Both are standard PDF annotations, written into the file right away, so
+other viewers show them too.
 
 Counts work like vim: `5j`, `3J`.
 

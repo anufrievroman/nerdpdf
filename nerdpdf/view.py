@@ -1,14 +1,18 @@
 """PDF page view (continuous feed or one page at a time) rendered with PyMuPDF."""
 
+import re
 from bisect import bisect_right
+from html import escape
 from collections import OrderedDict
 from math import ceil
 from time import monotonic
 
 import pymupdf
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QImageReader, QPainter, QPalette
-from PySide6.QtWidgets import QAbstractScrollArea
+from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication, QImage, QImageReader,
+                           QPainter, QPalette)
+from PySide6.QtWidgets import (QAbstractScrollArea, QDialog, QDialogButtonBox, QMenu, QPlainTextEdit,
+                               QToolTip, QVBoxLayout)
 
 GAP = 12  # px between pages and around the document
 MIN_ZOOM, MAX_ZOOM = 0.1, 12.0
@@ -23,11 +27,65 @@ SLIDE_RATIOS = (4 / 3, 16 / 10, 16 / 9)
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_HIT_COLOR = QColor(255, 140, 0, 170)
 
+NOTE_COLOR = QColor("#81d2d1")  # sticky-note icons
+BLUE_TEXT, BLACK_TEXT = QColor("#1b67e4"), QColor("black")  # text added with right-click
+SMALL_TEXT, LARGE_TEXT = 8, 12  # pt
+TEXT_FONT = "Helvetica"  # matches PyMuPDF's "helv", which the text is written with
+
 
 def _to_qimage(pix, dpr):
     img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
     img.setDevicePixelRatio(dpr)
     return img
+
+
+def _rgb(color):
+    return color.redF(), color.greenF(), color.blueF()
+
+
+def _text_font(px):
+    font = QFont(TEXT_FONT)
+    font.setPixelSize(max(1, round(px)))
+    return font
+
+
+class _EnterEdit(QPlainTextEdit):
+    """Text box where Enter or Esc (as in vim) finishes and Shift+Enter starts a new line."""
+    done = Signal()
+
+    def keyPressEvent(self, ev):
+        if (ev.key() in (Qt.Key_Return, Qt.Key_Enter) and not ev.modifiers() & Qt.ShiftModifier
+                or ev.key() == Qt.Key_Escape):
+            self.done.emit()
+        else:
+            super().keyPressEvent(ev)
+
+
+class _TextEditor(_EnterEdit):
+    """Inline editor for text added on the page; clicking away also keeps the text."""
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        self.done.emit()
+
+
+def _ask_note(parent, text):
+    """Dialog for a sticky note's text. Returns the new text, or None if cancelled."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Note")
+    ed = _EnterEdit(dlg, placeholderText="Enter or Esc saves, Shift+Enter starts a new line;\n"
+                                         "saving it empty removes the note")
+    ed.setPlainText(text)
+    ed.moveCursor(ed.textCursor().MoveOperation.End)
+    ed.done.connect(dlg.accept)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout = QVBoxLayout(dlg)
+    layout.addWidget(ed)
+    layout.addWidget(buttons)
+    dlg.resize(360, 220)
+    return ed.toPlainText() if dlg.exec() == QDialog.Accepted else None
 
 
 def is_image(doc):
@@ -60,6 +118,7 @@ class PdfView(QAbstractScrollArea):
     fullscreenRequested = Signal()
     openRequested = Signal()
     fileStep = Signal(int)  # images: paging past the first/last page moves this many files in the folder
+    documentEdited = Signal()  # a note or text was added, changed or deleted; the file should be saved
     quitRequested = Signal()
 
     def __init__(self, parent=None):
@@ -86,6 +145,10 @@ class PdfView(QAbstractScrollArea):
         self._g_pending = False
         self._drag_from = None  # last mouse position while middle-button panning
         self._right_down = False  # right button held: the wheel zooms
+        self._right_zoomed = False  # the wheel zoomed while the right button was held: no context menu
+        # (editor, page, x, y in displayed page points, xref of the text it replaces, size, color)
+        self._text_edit = None
+        self._annot_drag = None  # [page, xref, press position, displayed rect at press, moved yet]
         self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
         self._last_flip = 0.0
 
@@ -93,15 +156,22 @@ class PdfView(QAbstractScrollArea):
         self._render_timer.timeout.connect(self._render_visible)
 
         self.setFocusPolicy(Qt.StrongFocus)
+        # right clicks come through mouse*Event so they can also mean right button + wheel zoom
+        self.setContextMenuPolicy(Qt.PreventContextMenu)
+        self.viewport().setContextMenuPolicy(Qt.PreventContextMenu)
         self.setFrameShape(QAbstractScrollArea.NoFrame)
         self.verticalScrollBar().setSingleStep(40)
         self.horizontalScrollBar().setSingleStep(40)
         self.verticalScrollBar().valueChanged.connect(lambda _: self.stateChanged.emit())
+        # the inline text editor sits at a fixed spot, so moving the page keeps the text
+        self.verticalScrollBar().valueChanged.connect(lambda _: self._finish_text())
+        self.horizontalScrollBar().valueChanged.connect(lambda _: self._finish_text())
         QGuiApplication.styleHints().colorSchemeChanged.connect(self.viewport().update)
 
     # ---------------------------------------------------------------- document
 
     def set_document(self, doc):
+        self._finish_text()
         self.doc = doc
         self.sizes = [(p.rect.width, p.rect.height) for p in doc]
         self._cache.clear()
@@ -156,6 +226,7 @@ class PdfView(QAbstractScrollArea):
     # ------------------------------------------------------------------ layout
 
     def _relayout(self):
+        self._finish_text()
         z = self.zoom
         if self.single_page and self.sizes:
             # every page sits at the same spot (centred vertically when it is shorter than the
@@ -514,6 +585,219 @@ class PdfView(QAbstractScrollArea):
                               r.width() * z, r.height() * z), color)
         p.restore()
 
+    # ------------------------------------------------------------- annotations
+
+    def _page_hit(self, pos):
+        """Viewport point -> (page, x, y in displayed page points) if it is on a PDF page, else None."""
+        if not self.doc or not self.doc.is_pdf:
+            return None
+        i, x, y = self._locate(pos)
+        w, h = self.sizes[i]
+        if not (0 <= x <= w and 0 <= y <= h):
+            return None
+        return i, x, y
+
+    def _annot_at(self, i, x, y):
+        """Topmost note or text annotation under (x, y) on page i, or None.
+
+        Returns (xref, type, rect in displayed page points, text). Annotation objects stop
+        working once their page object is gone, so callers keep the xref and reload the
+        annotation with page.load_annot().
+        """
+        page = self.doc[i]
+        pt = pymupdf.Point(x, y) * page.derotation_matrix
+        found = None
+        for annot in page.annots(types=(pymupdf.PDF_ANNOT_TEXT, pymupdf.PDF_ANNOT_FREE_TEXT)):
+            if pt in annot.rect:
+                found = annot.xref, annot.type[0], annot.rect * page.rotation_matrix, annot.info["content"]
+        return found
+
+    def _annot_under(self, pos):
+        """(page, x, y, _annot_at result) for the note or text under viewport point pos, or None."""
+        hit = self._page_hit(pos)
+        found = hit and self._annot_at(*hit)
+        return (*hit, found) if found else None
+
+    def _context_menu(self, pos):
+        hit = self._page_hit(pos)
+        if hit is None:
+            return
+        i, x, y = hit
+        hit = self._annot_at(i, x, y)
+        menu = QMenu(self)
+        if hit is None:
+            menu.addAction("Add note", lambda: self._edit_note(i, x, y))
+            for name, color in (("blue", BLUE_TEXT), ("black", BLACK_TEXT)):
+                for label, size in (("small", SMALL_TEXT), ("large", LARGE_TEXT)):
+                    menu.addAction(f"Add {name} {label} text",
+                                   lambda size=size, color=color: self._start_text(i, x, y, size=size, color=color))
+        elif hit[1] == pymupdf.PDF_ANNOT_TEXT:
+            menu.addAction("Edit note", lambda: self._edit_note(i, x, y, hit[0]))
+            menu.addAction("Delete note", lambda: self._delete_annot(i, hit[0]))
+        else:
+            menu.addAction("Edit text", lambda: self._start_text(i, xref=hit[0]))
+            menu.addAction("Delete text", lambda: self._delete_annot(i, hit[0]))
+        menu.exec(self.viewport().mapToGlobal(pos.toPoint()))
+
+    def _drop_render(self, i):
+        old = self._cache.pop(i, None)
+        if old:
+            self._cache_bytes -= old[1].sizeInBytes()
+        self._clips.pop(i, None)
+        self.viewport().update()
+
+    def _annotations_changed(self, i):
+        self._drop_render(i)
+        self.documentEdited.emit()
+
+    def _delete_annot(self, i, xref):
+        page = self.doc[i]
+        page.delete_annot(page.load_annot(xref))
+        self._annotations_changed(i)
+
+    def _edit_note(self, i, x, y, xref=0):
+        """Ask for a sticky note's text in a dialog; add the note at (x, y) or update note xref.
+
+        Saving an empty note removes it.
+        """
+        page = self.doc[i]
+        annot = page.load_annot(xref) if xref else None
+        text = _ask_note(self, annot.info["content"] if annot else "")
+        if text is None or (annot is None and not text.strip()):
+            return
+        if not text.strip():
+            page.delete_annot(annot)
+            self._annotations_changed(i)
+            return
+        if annot:
+            annot.set_info(content=text)
+        else:
+            annot = page.add_text_annot(pymupdf.Point(x, y) * page.derotation_matrix, text)
+            annot.set_colors(stroke=_rgb(NOTE_COLOR))
+        annot.update()
+        self._annotations_changed(i)
+
+    def _start_text(self, i, x=0.0, y=0.0, xref=0, size=LARGE_TEXT, color=BLUE_TEXT):
+        """Open the inline editor for new text at (x, y), or for editing text xref in place."""
+        self._finish_text()
+        text = ""
+        if xref:
+            page = self.doc[i]
+            annot = page.load_annot(xref)
+            r = annot.rect * page.rotation_matrix
+            x, y, text = r.x0, r.y0, annot.info["content"]
+            # keep the color and font size, stored in the default appearance, e.g. "0 0 1 rg /Helv 12 Tf"
+            da = self.doc.xref_get_key(xref, "DA")[1]
+            m = re.search(r"([\d.]+)\s+Tf", da)
+            size = float(m.group(1)) if m else size
+            m = re.search(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg", da)
+            color = QColor.fromRgbF(*(float(c) for c in m.groups())) if m else color
+        ed = _TextEditor(self.viewport())
+        ed.setFont(_text_font(size * self.zoom))
+        ed.setStyleSheet(f"QPlainTextEdit {{ background: white; color: {color.name()};"
+                         f" border: 1px dashed {color.name()}; }}")
+        ed.setLineWrapMode(QPlainTextEdit.NoWrap)
+        ed.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ed.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ed.document().setDocumentMargin(0)
+        ed.setPlainText(text)
+        ed.moveCursor(ed.textCursor().MoveOperation.End)
+        self._text_edit = (ed, i, x, y, xref, size, color)
+        self._place_text_editor()
+        ed.textChanged.connect(self._place_text_editor)
+        ed.done.connect(self._finish_text)
+        ed.show()
+        ed.setFocus()
+
+    def _place_text_editor(self):
+        ed, i, x, y, *_ = self._text_edit
+        rect = self._page_rect(i)
+        fm = ed.fontMetrics()
+        lines = ed.toPlainText().split("\n")
+        w = max(fm.horizontalAdvance(line) for line in lines) + 2 * fm.averageCharWidth()
+        h = fm.lineSpacing() * len(lines) + 4
+        ed.setGeometry(round(rect.x() + x * self.zoom) - 2, round(rect.y() + y * self.zoom) - 2, w + 4, h)
+
+    def _finish_text(self):
+        """Close the inline editor and write its text to the page; empty text removes it."""
+        if not self._text_edit:
+            return
+        ed, i, x, y, xref, size, color = self._text_edit
+        self._text_edit = None
+        text = ed.toPlainText().rstrip()
+        ed.hide()
+        ed.deleteLater()
+        self.setFocus()
+        page = self.doc[i]
+        if xref:
+            old = page.load_annot(xref)
+            if old is None or old.info["content"] == text:
+                return
+            page.delete_annot(old)
+        elif not text:
+            return
+        if text:
+            fm = QFontMetricsF(_text_font(size))  # pixel size = points at zoom 1
+            lines = text.split("\n")
+            w = max(fm.horizontalAdvance(line) for line in lines) * 1.05 + 4
+            h = len(lines) * size * 1.2 + 4
+            rect = pymupdf.Rect(x, y, x + w, y + h) * page.derotation_matrix
+            page.add_freetext_annot(rect, text, fontsize=size, fontname="helv",
+                                    text_color=_rgb(color), rotate=page.rotation)
+        self._annotations_changed(i)
+
+    def _start_drag(self, pos):
+        """Left press: start dragging the note or text under pos. Returns False if there is none."""
+        under = self._annot_under(pos)
+        if not under:
+            return False
+        i, _, _, (xref, _, rect, _) = under
+        self._annot_drag = [i, xref, pos, rect, False]
+        return True
+
+    def _open_annot(self, pos):
+        """Double click: edit the note or text under pos. Returns False if there is none."""
+        under = self._annot_under(pos)
+        if not under:
+            return False
+        i, x, y, (xref, kind, _, _) = under
+        if kind == pymupdf.PDF_ANNOT_TEXT:
+            self._edit_note(i, x, y, xref)
+        else:
+            self._start_text(i, xref=xref)
+        return True
+
+    def _note_tooltip(self, ev):
+        """Hovering over a sticky note shows its text."""
+        under = self._annot_under(QPointF(ev.pos()))
+        if not under or under[3][1] != pymupdf.PDF_ANNOT_TEXT or not under[3][3].strip():
+            QToolTip.hideText()
+            return
+        i, _, _, (_, _, r, text) = under
+        page, z = self._page_rect(i), self.zoom
+        area = QRectF(page.x() + r.x0 * z, page.y() + r.y0 * z, r.width * z, r.height * z).toAlignedRect()
+        QToolTip.showText(ev.globalPos(), f"<p style='white-space:pre-wrap'>{escape(text)}</p>",
+                          self.viewport(), area)
+
+    def _drag_to(self, pos):
+        """Move the dragged annotation with the mouse, keeping it on its page.
+
+        The page is re-rendered on every move (a few ms); the file is saved on release.
+        """
+        i, xref, start, r0, moved = self._annot_drag
+        if not moved and (pos - start).manhattanLength() < QGuiApplication.styleHints().startDragDistance():
+            return
+        self._annot_drag[4] = True
+        self.viewport().setCursor(Qt.ClosedHandCursor)
+        w, h = self.sizes[i]
+        x = max(0.0, min(r0.x0 + (pos.x() - start.x()) / self.zoom, w - r0.width))
+        y = max(0.0, min(r0.y0 + (pos.y() - start.y()) / self.zoom, h - r0.height))
+        page = self.doc[i]
+        annot = page.load_annot(xref)
+        annot.set_rect(pymupdf.Rect(x, y, x + r0.width, y + r0.height) * page.derotation_matrix)
+        annot.update()
+        self._drop_render(i)
+
     # ------------------------------------------------------------------ events
 
     def resizeEvent(self, ev):
@@ -530,6 +814,8 @@ class PdfView(QAbstractScrollArea):
             self._relayout()
 
     def wheelEvent(self, ev):
+        if self._right_down:
+            self._right_zoomed = True
         if self._right_down or ev.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
             d = ev.angleDelta()
             delta = d.y() or d.x()  # macOS turns shift+wheel into horizontal scroll
@@ -566,8 +852,10 @@ class PdfView(QAbstractScrollArea):
         return True
 
     def mousePressEvent(self, ev):
+        self._finish_text()
         if ev.button() == Qt.RightButton:
             self._right_down = True
+            self._right_zoomed = False
             ev.accept()
             return
         if ev.button() == Qt.MiddleButton:
@@ -575,9 +863,16 @@ class PdfView(QAbstractScrollArea):
             self.viewport().setCursor(Qt.ClosedHandCursor)
             ev.accept()
             return
+        if ev.button() == Qt.LeftButton and self._start_drag(ev.position()):
+            ev.accept()
+            return
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._annot_drag:
+            self._drag_to(ev.position())
+            ev.accept()
+            return
         if self._drag_from is not None:
             d = ev.position() - self._drag_from
             self._drag_from = ev.position()
@@ -589,6 +884,8 @@ class PdfView(QAbstractScrollArea):
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.RightButton:
             self._right_down = False
+            if not self._right_zoomed:
+                self._context_menu(ev.position())
             ev.accept()
             return
         if ev.button() == Qt.MiddleButton and self._drag_from is not None:
@@ -596,11 +893,28 @@ class PdfView(QAbstractScrollArea):
             self.viewport().unsetCursor()
             ev.accept()
             return
+        if ev.button() == Qt.LeftButton and self._annot_drag:
+            i, moved = self._annot_drag[0], self._annot_drag[4]
+            self._annot_drag = None
+            self.viewport().unsetCursor()
+            if moved:
+                self._annotations_changed(i)
+            ev.accept()
+            return
         super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self._open_annot(ev.position()):
+            ev.accept()
+            return
+        super().mouseDoubleClickEvent(ev)
 
     def viewportEvent(self, ev):
         if ev.type() == QEvent.NativeGesture and ev.gestureType() == Qt.ZoomNativeGesture:
             self.zoom_by(1 + ev.value(), ev.position())
+            return True
+        if ev.type() == QEvent.ToolTip:
+            self._note_tooltip(ev)
             return True
         return super().viewportEvent(ev)
 

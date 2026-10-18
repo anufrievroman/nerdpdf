@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
         self.view.searchRequested.connect(self.show_search)
         self.view.openRequested.connect(self.open_dialog)
         self.view.fileStep.connect(self.step_image)
+        self.view.documentEdited.connect(self._save_edits)
         self.view.quitRequested.connect(self.close)
         self.view.searchStep.connect(lambda forward: self._search(self.search_line.text(), forward))
         self.view.escapePressed.connect(self._escape)
@@ -162,6 +163,24 @@ class MainWindow(QMainWindow):
                     self.view.goto_page(len(doc) - 1)
                 return
             i += step
+
+    def _save_edits(self):
+        """Write added notes and text into the PDF right away."""
+        doc = self.view.doc
+        tmp = doc.name + ".nerdpdf-tmp"
+        try:
+            if doc.can_save_incrementally():
+                doc.saveIncr()
+            else:  # e.g. a repaired file: rewrite it whole and reopen it
+                doc.save(tmp, garbage=1)
+                os.replace(tmp, doc.name)
+                pos = self.view.position()
+                self.view.set_document(_load(doc.name))
+                self.view.set_position(*pos)
+        except Exception as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            QMessageBox.warning(self, "nerdpdf", f"Cannot save changes to {doc.name}:\n{e}")
 
     def _remember_zoom(self):
         if self.path and not self.view.presentation:
@@ -261,7 +280,9 @@ KEYS = """keys:
   d                single page / continuous feed
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
-  middle-drag      pan"""
+  middle-drag      pan
+  right-click      PDFs: add a note or text (on one: edit / delete); saved to the file
+  left-drag        move a note or text (double-click: edit it; hover a note to read it)"""
 
 
 def parse_args(argv):
