@@ -116,12 +116,12 @@ class ColorButton(QPushButton):
 
 class SettingsDialog(QDialog):
     """How new annotations look: text size and color, strikethrough /
-    underline color, highlight and note colors."""
+    underline color, highlight and note colors; and the page color with inverted colors."""
 
     COLORS = (("text_color", "Font color"), ("line_color", "Line color (strikethrough, underline)"),
               ("highlight_color", "Highlight color"), ("note_color", "Note color"))
 
-    def __init__(self, style, parent=None):
+    def __init__(self, style, dark_color, parent=None):
         super().__init__(parent)
         self.setWindowTitle("nerdpdf settings")
         form = QFormLayout(self)
@@ -131,6 +131,8 @@ class SettingsDialog(QDialog):
         for key, label in self.COLORS:
             self.buttons[key] = ColorButton(style[key], label, self)
             form.addRow(label, self.buttons[key])
+        self.dark_color = ColorButton(dark_color, "Inverted page color", self)
+        form.addRow("Inverted page color (R)", self.dark_color)
         box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
@@ -188,15 +190,15 @@ class AnnotationsMixin:
         found = hit and self._annot_at(*hit)
         return (*hit, found) if found else None
 
-    def _mark_at(self, i, x, y):
-        """(xref, type) of the topmost highlight, strikethrough or underline over (x, y) on page i, or None."""
+    def _marks_at(self, i, x, y):
+        """[(xref, type)] of the highlights, strikethroughs and underlines over (x, y) on page i."""
         page = self.doc[i]
         pt = pymupdf.Point(x, y) * page.derotation_matrix
-        found = None
+        found = []
         for annot in page.annots(types=tuple(MARK_NAMES)):
             v = annot.vertices  # 4 corners per marked line
             if any(pt in pymupdf.Quad(*v[k:k + 4]).rect for k in range(0, len(v), 4)):
-                found = annot.xref, annot.type[0]
+                found.append((annot.xref, annot.type[0]))
         return found
 
     def _context_menu(self, pos):
@@ -209,7 +211,12 @@ class AnnotationsMixin:
         font = QFontDatabase.systemFont(QFontDatabase.FixedFont)  # monospace so the symbols line up
         font.setPointSizeF(menu.font().pointSizeF())
         menu.setFont(font)
-        if hit is None:
+        # on a note, text or marked text the menu only edits / deletes it; Settings is on the plain page menu
+        marks = self._marks_at(i, x, y) if hit is None else []
+        if marks:
+            for xref, kind in marks:
+                menu.addAction(f"✕  Delete {MARK_NAMES[kind]}", lambda xref=xref: self._delete_annot(i, xref))
+        elif hit is None:
             menu.addAction("□  Add note", lambda: self._edit_note(i, x, y))
             menu.addAction("T  Add text", lambda: self._start_text(i, x, y))
             menu.addSeparator()
@@ -217,17 +224,14 @@ class AnnotationsMixin:
             menu.addAction("S̶  Strike through text", lambda: self._start_mark("strike"))
             menu.addAction("▁  Underline text", lambda: self._start_mark("underline"))
             menu.addAction("◫  Select text to copy", lambda: self._start_mark("copy"))
-            mark = self._mark_at(i, x, y)
-            if mark:
-                menu.addAction(f"✕  Delete {MARK_NAMES[mark[1]]}", lambda: self._delete_annot(i, mark[0]))
+            menu.addSeparator()
+            menu.addAction("⚙  Settings...", self.settingsRequested.emit)
         elif hit[1] == pymupdf.PDF_ANNOT_TEXT:
             menu.addAction("✎  Edit note", lambda: self._edit_note(i, x, y, hit[0]))
             menu.addAction("✕  Delete note", lambda: self._delete_annot(i, hit[0]))
         else:
             menu.addAction("✎  Edit text", lambda: self._start_text(i, xref=hit[0]))
             menu.addAction("✕  Delete text", lambda: self._delete_annot(i, hit[0]))
-        menu.addSeparator()
-        menu.addAction("⚙  Settings...", self.settingsRequested.emit)
         menu.exec(self.viewport().mapToGlobal(pos.toPoint()))
 
     def _annotations_changed(self, i):

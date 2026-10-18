@@ -24,6 +24,7 @@ SLIDE_RATIOS = (4 / 3, 16 / 10, 16 / 9)
 
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_HIT_COLOR = QColor(255, 140, 0, 170)
+DARK_COLOR = QColor("#252525")  # what white becomes with inverted colors (R); changed in Settings
 
 
 def _to_qimage(pix, dpr):
@@ -64,6 +65,7 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
     fileStep = Signal(int)  # images: paging past the first/last page moves this many files in the folder
     documentEdited = Signal()  # a note or text was added, changed or deleted; the file should be saved
     quitRequested = Signal()
+    invertRequested = Signal()
     settingsRequested = Signal()
 
     def __init__(self, parent=None):
@@ -79,6 +81,8 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         self.fit_cap = None  # images: fit page never enlarges beyond their natural size
         self.single_page = False  # show only self.page instead of the continuous feed
         self.page = 0  # the page shown in single-page mode
+        self.inverted = False  # render white as dark_color and black as white (not for images)
+        self.dark_color = QColor(DARK_COLOR)
 
         self._cache = OrderedDict()  # page -> (scale, QImage) full-page renders
         self._cache_bytes = 0
@@ -175,6 +179,16 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         self.set_position(i, py)
         self.viewport().update()
         self.stateChanged.emit()
+
+    def set_inverted(self, on, dark_color=None):
+        if dark_color is not None:
+            self.dark_color = QColor(dark_color)
+        self.inverted = on
+        self._uncache()
+        self.viewport().update()
+
+    def _inverting(self):
+        return self.inverted and not self.is_image
 
     # ------------------------------------------------------------------ layout
 
@@ -466,9 +480,14 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
             _, (_, dropped) = self._cache.popitem(last=False)
             self._cache_bytes -= dropped.sizeInBytes()
 
+    def _render(self, i, scale, dpr, clip=None):
+        pix = self.doc[i].get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=clip, alpha=False)
+        if self._inverting():
+            pix.tint_with(0xFFFFFF, self.dark_color.rgb() & 0xFFFFFF)  # black -> white, white -> dark
+        return _to_qimage(pix, dpr)
+
     def _render_full(self, i, scale, dpr):
-        pix = self.doc[i].get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
-        self._cache_put(i, scale, _to_qimage(pix, dpr))
+        self._cache_put(i, scale, self._render(i, scale, dpr))
 
     def _clip_key(self, i, rect, scale):
         """Visible part of page rect (viewport coords) -> (scale, clip in page points)."""
@@ -480,9 +499,7 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
 
     def _render_clip(self, i, key, dpr):
         scale, clip = key
-        pix = self.doc[i].get_pixmap(matrix=pymupdf.Matrix(scale, scale),
-                                     clip=pymupdf.Rect(clip), alpha=False)
-        self._clips[i] = (key, _to_qimage(pix, dpr))
+        self._clips[i] = (key, self._render(i, scale, dpr, pymupdf.Rect(clip)))
 
     def _is_huge(self, rect, dpr):
         return rect.width() * rect.height() * dpr * dpr > FULL_RENDER_LIMIT
@@ -511,10 +528,11 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         dpr = self.viewport().devicePixelRatioF()
         scale = self.zoom * dpr
         stale = False
+        paper = self.dark_color if self._inverting() else QColor(Qt.white)
         for i in self._visible_pages():
             rect = self._page_rect(i)
             p.fillRect(rect.translated(0, 2), QColor(0, 0, 0, 50))
-            p.fillRect(rect, Qt.white)
+            p.fillRect(rect, paper)
             cached = self._cache.get(i)
             if cached:
                 self._cache.move_to_end(i)
@@ -547,7 +565,8 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         if not hits:
             return
         p.save()
-        p.setCompositionMode(QPainter.CompositionMode_Multiply)
+        if not self._inverting():  # multiplying would darken a dark page to near black
+            p.setCompositionMode(QPainter.CompositionMode_Multiply)
         for k, r in enumerate(hits):
             p.fillRect(self._view_rect(i, r), CURRENT_HIT_COLOR if self._current_hit == (i, k) else HIT_COLOR)
         p.restore()
@@ -749,6 +768,8 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
                 self.searchRequested.emit()
         elif key == Qt.Key_Escape:
             self.escapePressed.emit()
+        elif t == "R":
+            self.invertRequested.emit()
         elif t in ("f", "F"):
             self.fullscreenRequested.emit()
         elif t == "o":

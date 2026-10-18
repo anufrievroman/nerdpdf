@@ -79,6 +79,8 @@ class MainWindow(QMainWindow):
 
         self.view = PdfView()
         self.view.annot_style = load_annot_style(self.settings)
+        dark = QColor(str(self.settings.value("dark_color", "")))
+        self.view.set_inverted(self.settings.value("inverted", False, type=bool), dark if dark.isValid() else None)
         # remembered zoom for regular documents; slides always open fitted to the page
         self.zoom_pref = (float(self.settings.value("zoom", 1.0)),
                           self.settings.value("fit_mode", "width") or None)
@@ -112,6 +114,7 @@ class MainWindow(QMainWindow):
         self.view.documentEdited.connect(self._edited)
         self.view.quitRequested.connect(self.close)
         self.view.settingsRequested.connect(self.edit_settings)
+        self.view.invertRequested.connect(self.toggle_inverted)
         self.view.searchStep.connect(lambda forward: self._search(self.search_line.text(), forward))
         self.view.escapePressed.connect(self._escape)
         self.view.fullscreenRequested.connect(self.toggle_fullscreen)
@@ -255,14 +258,25 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------- misc
 
     def edit_settings(self):
-        dlg = SettingsDialog(self.view.annot_style, self)
+        dlg = SettingsDialog(self.view.annot_style, self.view.dark_color, self)
         if dlg.exec() != QDialog.Accepted:
             return
         style = dlg.values()
         for key, value in style.items():
             self.settings.setValue(f"annotations/{key}", value.name() if isinstance(value, QColor) else value)
+        dark = dlg.dark_color.color
+        self.settings.setValue("dark_color", dark.name())
         for win in QApplication.instance().windows:
             win.view.annot_style = dict(style)
+            if dark != win.view.dark_color:
+                win.view.set_inverted(win.view.inverted, dark)
+
+    def toggle_inverted(self):
+        """R: invert colors in all windows; remembered for next time."""
+        on = not self.view.inverted
+        self.settings.setValue("inverted", on)
+        for win in QApplication.instance().windows:
+            win.view.set_inverted(on)
 
     def toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
@@ -311,12 +325,13 @@ KEYS = """keys:
   = (+) -          zoom in / out (also right button+wheel, Shift/Cmd+wheel, pinch)
   /                search (Enter to find, Esc to close; not for images)
   d                single page / continuous feed
+  R                invert colors: white -> dark (set in Settings), black -> white
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
   middle-drag      pan
   right-click      PDFs: add a note or text; highlight, strike through, underline or
-                   copy text (on one: edit / delete); saved to the file.
-                   Settings: font size and colors of new annotations
+                   copy text (on one only: edit / delete); saved to the file.
+                   Settings: font size and colors of new annotations, inverted page color
   Shift+left-drag  PDFs: select text to copy it to the clipboard
   left-drag        move a note or text (double-click: edit it; hover a note to read it)"""
 

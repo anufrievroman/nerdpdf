@@ -40,12 +40,13 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `=` (`+`) / `-` | zoom in / out |
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
-| right-click | PDFs: add a note or text there, or highlight / strike through / underline / copy text; on an existing one: edit / delete; Settings |
+| right-click | PDFs: add a note or text there, or highlight / strike through / underline / copy text; Settings; on an existing one only edit / delete it (marked text: delete the marks) |
 | Shift + left-drag | PDFs: select text and copy it to the clipboard |
 | left-drag on a note or text | move it |
 | double-click on a note or text | edit it |
 | hover over a note | show its text |
 | `/` | search: Enter finds, then `n` / `N` = next / previous match, Esc = close |
+| `R` | invert colors (white becomes a dark color, set in Settings; black becomes white); not for images |
 | `f` / `F` | toggle fullscreen; `Esc` leaves it (after closing search, if open) |
 | `o` | open file (drag & drop works too) |
 | `q` | quit |
