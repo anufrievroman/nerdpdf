@@ -1,0 +1,16 @@
+[project]
+name = "nerdpdf"
+version = "0.1.0"
+description = "Minimal keyboard-driven PDF viewer"
+requires-python = ">=3.10"
+dependencies = ["pymupdf>=1.24", "PySide6-Essentials>=6.5"]
+
+[project.scripts]
+nerdpdf = "nerdpdf.app:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["nerdpdf"]
