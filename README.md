@@ -34,7 +34,7 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `=` / `-` | zoom in / out |
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
-| right-click | PDFs: add a note or text there; on an existing one: edit / delete |
+| right-click | PDFs: add a note or text there, or highlight / strike through text; on an existing one: edit / delete |
 | left-drag on a note or text | move it |
 | double-click on a note or text | edit it |
 | hover over a note | show its text |
@@ -59,8 +59,15 @@ Right-click on a PDF page to add a sticky note (its text is entered in a dialog)
 black, small (8pt) or large (12pt) text (typed in place). In both, Enter or Esc (as in vim)
 saves the text, Shift+Enter starts a new line, and saving it empty removes the note or text.
 Drag a note or text with the left button to move it, double-click it to edit it; hovering over
-a note shows its text. Both are standard PDF annotations, written into the file right away, so
-other viewers show them too.
+a note shows its text. Both are standard PDF annotations, so other viewers show them too.
+
+Annotations are written into the PDF 15 seconds after the last change (and when the window
+closes or another file opens), so a burst of edits is a single write and a single cloud upload.
+The save is incremental: changes are appended to the end of the file.
+
+"Highlight text" and "Strike through text" turn the cursor into a text cursor: drag over text
+(or click a word) to highlight it or strike it through in blue; Esc or a right click cancels.
+Right-click highlighted or struck text to delete the highlight or strikethrough.
 
 Counts work like vim: `5j`, `3J`.
 

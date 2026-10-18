@@ -18,6 +18,7 @@ from .view import PdfView, is_image, looks_like_slides
 
 
 DOC_TYPES = "*.pdf *.epub *.xps *.cbz"
+SAVE_DELAY = 15_000  # ms after the last annotation change before the PDF is written
 IMAGE_TYPES = "*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.pnm *.pbm *.pgm *.ppm *.psd *.jxr"
 IMAGE_EXTS = {t[1:] for t in IMAGE_TYPES.split()}
 
@@ -93,7 +94,11 @@ class MainWindow(QMainWindow):
         self.view.searchRequested.connect(self.show_search)
         self.view.openRequested.connect(self.open_dialog)
         self.view.fileStep.connect(self.step_image)
-        self.view.documentEdited.connect(self._save_edits)
+        # saving waits for a pause in editing, so a burst of changes is one write (and one cloud upload)
+        self._edits_pending = False
+        self._save_timer = QTimer(self, singleShot=True, interval=SAVE_DELAY)
+        self._save_timer.timeout.connect(self.flush_edits)
+        self.view.documentEdited.connect(self._edited)
         self.view.quitRequested.connect(self.close)
         self.view.searchStep.connect(lambda forward: self._search(self.search_line.text(), forward))
         self.view.escapePressed.connect(self._escape)
@@ -126,6 +131,7 @@ class MainWindow(QMainWindow):
         self._show(path, doc)
 
     def _show(self, path, doc):
+        self.flush_edits()
         self._save_position()
         self._remember_zoom()
         self.path = path
@@ -164,8 +170,19 @@ class MainWindow(QMainWindow):
                 return
             i += step
 
+    def _edited(self):
+        self._edits_pending = True
+        self._save_timer.start()
+
+    def flush_edits(self):
+        """Write pending annotation changes now (also before closing or opening another file)."""
+        self.view.finish_editing()
+        self._save_timer.stop()
+        if self._edits_pending:
+            self._edits_pending = False
+            self._save_edits()
+
     def _save_edits(self):
-        """Write added notes and text into the PDF right away."""
         doc = self.view.doc
         tmp = doc.name + ".nerdpdf-tmp"
         try:
@@ -261,6 +278,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{name} — {page} — {zoom}")
 
     def closeEvent(self, ev):
+        self.flush_edits()
         self._save_position()
         self._remember_zoom()
         self.settings.setValue("zoom", self.zoom_pref[0])
@@ -281,7 +299,8 @@ KEYS = """keys:
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
   middle-drag      pan
-  right-click      PDFs: add a note or text (on one: edit / delete); saved to the file
+  right-click      PDFs: add a note or text, highlight or strike through text
+                   (on one: edit / delete); saved to the file
   left-drag        move a note or text (double-click: edit it; hover a note to read it)"""
 
 
@@ -304,6 +323,7 @@ class Application(QApplication):
         super().__init__(argv)
         self.windows = []
         self.fileOpened.connect(self.open_file)
+        self.aboutToQuit.connect(lambda: [w.flush_edits() for w in self.windows])
 
     def event(self, ev):
         if ev.type() == QEvent.FileOpen:

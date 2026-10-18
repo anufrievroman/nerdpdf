@@ -26,8 +26,9 @@ SLIDE_RATIOS = (4 / 3, 16 / 10, 16 / 9)
 
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_HIT_COLOR = QColor(255, 140, 0, 170)
+SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through
 
-NOTE_COLOR = QColor("#81d2d1")  # sticky-note icons
+NOTE_COLOR = HIGHLIGHT_COLOR = QColor("#7cd9e7")  # sticky-note icons and highlights
 BLUE_TEXT, BLACK_TEXT = QColor("#1b67e4"), QColor("black")  # text added with right-click
 SMALL_TEXT, LARGE_TEXT = 8, 12  # pt
 TEXT_FONT = "Helvetica"  # matches PyMuPDF's "helv", which the text is written with
@@ -149,6 +150,8 @@ class PdfView(QAbstractScrollArea):
         # (editor, page, x, y in displayed page points, xref of the text it replaces, size, color)
         self._text_edit = None
         self._annot_drag = None  # [page, xref, press position, displayed rect at press, moved yet]
+        self._mark = None  # "highlight" / "strike": the next left drag selects text to mark that way
+        self._select = None  # [page, words, first word, last word, pressed on a word] while selecting
         self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
         self._last_flip = 0.0
 
@@ -172,6 +175,7 @@ class PdfView(QAbstractScrollArea):
 
     def set_document(self, doc):
         self._finish_text()
+        self._end_mark()
         self.doc = doc
         self.sizes = [(p.rect.width, p.rect.height) for p in doc]
         self._cache.clear()
@@ -569,6 +573,7 @@ class PdfView(QAbstractScrollArea):
                     stale = True
                 p.drawImage(rect, cached[1])
             self._paint_hits(p, i, rect)
+            self._paint_selection(p, i, rect)
         if stale:
             self._render_timer.start()
 
@@ -631,6 +636,13 @@ class PdfView(QAbstractScrollArea):
                 for label, size in (("small", SMALL_TEXT), ("large", LARGE_TEXT)):
                     menu.addAction(f"Add {name} {label} text",
                                    lambda size=size, color=color: self._start_text(i, x, y, size=size, color=color))
+            menu.addSeparator()
+            menu.addAction("Highlight text", lambda: self._start_mark("highlight"))
+            menu.addAction("Strike through text", lambda: self._start_mark("strike"))
+            mark = self._mark_at(i, x, y)
+            if mark:
+                name = "highlight" if mark[1] == pymupdf.PDF_ANNOT_HIGHLIGHT else "strikethrough"
+                menu.addAction(f"Delete {name}", lambda: self._delete_annot(i, mark[0]))
         elif hit[1] == pymupdf.PDF_ANNOT_TEXT:
             menu.addAction("Edit note", lambda: self._edit_note(i, x, y, hit[0]))
             menu.addAction("Delete note", lambda: self._delete_annot(i, hit[0]))
@@ -718,6 +730,10 @@ class PdfView(QAbstractScrollArea):
         h = fm.lineSpacing() * len(lines) + 4
         ed.setGeometry(round(rect.x() + x * self.zoom) - 2, round(rect.y() + y * self.zoom) - 2, w + 4, h)
 
+    def finish_editing(self):
+        """Close the inline text editor, keeping its text (e.g. before the window closes)."""
+        self._finish_text()
+
     def _finish_text(self):
         """Close the inline editor and write its text to the page; empty text removes it."""
         if not self._text_edit:
@@ -745,6 +761,95 @@ class PdfView(QAbstractScrollArea):
             page.add_freetext_annot(rect, text, fontsize=size, fontname="helv",
                                     text_color=_rgb(color), rotate=page.rotation)
         self._annotations_changed(i)
+
+    def _mark_at(self, i, x, y):
+        """(xref, type) of the topmost highlight or strikethrough over (x, y) on page i, or None."""
+        page = self.doc[i]
+        pt = pymupdf.Point(x, y) * page.derotation_matrix
+        found = None
+        for annot in page.annots(types=(pymupdf.PDF_ANNOT_HIGHLIGHT, pymupdf.PDF_ANNOT_STRIKE_OUT)):
+            v = annot.vertices  # 4 corners per marked line
+            if any(pt in pymupdf.Quad(*v[k:k + 4]).rect for k in range(0, len(v), 4)):
+                found = annot.xref, annot.type[0]
+        return found
+
+    def _start_mark(self, kind):
+        """Context menu: the next left drag (or click on a word) highlights or strikes through
+        text, kind "highlight" or "strike"; Esc cancels."""
+        self._mark = kind
+        self.viewport().setCursor(Qt.IBeamCursor)
+
+    def _end_mark(self):
+        if self._mark or self._select:
+            self._mark = None
+            self._select = None
+            self.viewport().unsetCursor()
+            self.viewport().update()
+
+    def _unrotated_point(self, i, pos):
+        """Viewport point -> point on page i in unrotated page points (may lie outside the page)."""
+        x = (self.horizontalScrollBar().value() + pos.x() - self._page_x(i)) / self.zoom
+        y = (self.verticalScrollBar().value() + pos.y() - self.tops[i]) / self.zoom
+        return pymupdf.Point(x, y) * self.doc[i].derotation_matrix
+
+    @staticmethod
+    def _word_near(words, pt):
+        """Index of the word nearest pt, preferring words on the same line, and whether pt is on it."""
+        def gaps(w):
+            return max(w[1] - pt.y, 0, pt.y - w[3]), max(w[0] - pt.x, 0, pt.x - w[2])
+        k = min(range(len(words)), key=lambda k: gaps(words[k]))
+        return k, gaps(words[k]) == (0, 0)
+
+    def _select_start(self, pos):
+        """Mark mode, left press: start selecting at the word nearest pos."""
+        hit = self._page_hit(pos)
+        words = self.doc[hit[0]].get_text("words") if hit else []
+        if not words:
+            self._end_mark()
+            return
+        k, on_word = self._word_near(words, self._unrotated_point(hit[0], pos))
+        self._select = [hit[0], words, k, k, on_word]
+        self.viewport().update()
+
+    def _select_to(self, pos):
+        i, words = self._select[:2]
+        self._select[3] = self._word_near(words, self._unrotated_point(i, pos))[0]
+        self.viewport().update()
+
+    def _selected_lines(self):
+        """Selected words merged into one rect per text line, in unrotated page points."""
+        _, words, a, b, _ = self._select
+        lines = {}
+        for w in words[min(a, b):max(a, b) + 1]:
+            key, r = (w[5], w[6]), pymupdf.Rect(w[:4])
+            lines[key] = lines[key] | r if key in lines else r
+        return list(lines.values())
+
+    def _select_finish(self):
+        """Highlight or strike through the selected text; a click off any word marks nothing."""
+        i, _, a, b, on_word = self._select
+        lines, kind = self._selected_lines(), self._mark
+        self._end_mark()
+        if a == b and not on_word:
+            return
+        page = self.doc[i]  # the annotation only works while its page object is alive
+        quads = [r.quad for r in lines]
+        if kind == "highlight":
+            annot = page.add_highlight_annot(quads=quads)
+            annot.set_colors(stroke=_rgb(HIGHLIGHT_COLOR))
+        else:
+            annot = page.add_strikeout_annot(quads=quads)
+            annot.set_colors(stroke=_rgb(BLUE_TEXT))
+        annot.update()
+        self._annotations_changed(i)
+
+    def _paint_selection(self, p, i, rect):
+        if not self._select or self._select[0] != i:
+            return
+        m, z = self.doc[i].rotation_matrix, self.zoom
+        for r in self._selected_lines():
+            r = r * m
+            p.fillRect(QRectF(rect.x() + r.x0 * z, rect.y() + r.y0 * z, r.width * z, r.height * z), SELECT_COLOR)
 
     def _start_drag(self, pos):
         """Left press: start dragging the note or text under pos. Returns False if there is none."""
@@ -855,12 +960,18 @@ class PdfView(QAbstractScrollArea):
         self._finish_text()
         if ev.button() == Qt.RightButton:
             self._right_down = True
-            self._right_zoomed = False
+            # a right click while selecting text to highlight / strike through only cancels that
+            self._right_zoomed = bool(self._mark)
+            self._end_mark()
             ev.accept()
             return
         if ev.button() == Qt.MiddleButton:
             self._drag_from = ev.position()
             self.viewport().setCursor(Qt.ClosedHandCursor)
+            ev.accept()
+            return
+        if ev.button() == Qt.LeftButton and self._mark:
+            self._select_start(ev.position())
             ev.accept()
             return
         if ev.button() == Qt.LeftButton and self._start_drag(ev.position()):
@@ -869,6 +980,10 @@ class PdfView(QAbstractScrollArea):
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._select:
+            self._select_to(ev.position())
+            ev.accept()
+            return
         if self._annot_drag:
             self._drag_to(ev.position())
             ev.accept()
@@ -890,7 +1005,11 @@ class PdfView(QAbstractScrollArea):
             return
         if ev.button() == Qt.MiddleButton and self._drag_from is not None:
             self._drag_from = None
-            self.viewport().unsetCursor()
+            self.viewport().setCursor(Qt.IBeamCursor) if self._mark else self.viewport().unsetCursor()
+            ev.accept()
+            return
+        if ev.button() == Qt.LeftButton and self._select:
+            self._select_finish()
             ev.accept()
             return
         if ev.button() == Qt.LeftButton and self._annot_drag:
@@ -920,6 +1039,9 @@ class PdfView(QAbstractScrollArea):
 
     def keyPressEvent(self, ev):
         t, key = ev.text(), ev.key()
+        if key == Qt.Key_Escape and self._mark:
+            self._end_mark()
+            return
         if t.isdigit() and (self._count or t != "0"):
             self._count += t
             return
