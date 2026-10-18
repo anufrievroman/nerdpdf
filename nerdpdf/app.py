@@ -9,12 +9,13 @@ from bisect import bisect_left
 
 import pymupdf
 from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-                               QMainWindow, QMessageBox, QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtWidgets import (QApplication, QColorDialog, QDialog, QDialogButtonBox, QFileDialog,
+                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from . import __version__
-from .view import PdfView, is_image, looks_like_slides
+from .view import ANNOT_STYLE, PdfView, is_image, looks_like_slides
 
 
 DOC_TYPES = "*.pdf *.epub *.xps *.cbz"
@@ -47,6 +48,69 @@ def _folder_images(directory):
     return sorted(names, key=_natural_key)
 
 
+def load_annot_style(settings):
+    """ANNOT_STYLE with the values saved from the Settings dialog."""
+    style = dict(ANNOT_STYLE)
+    try:
+        style["text_size"] = int(settings.value("annotations/text_size", style["text_size"]))
+    except (TypeError, ValueError):
+        pass
+    for key in ("text_color", "line_color", "highlight_color", "note_color"):
+        color = QColor(str(settings.value(f"annotations/{key}", "")))
+        if color.isValid():
+            style[key] = color
+    return style
+
+
+class ColorButton(QPushButton):
+    """Shows a color; clicking it picks another one."""
+
+    def __init__(self, color, title, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.set_color(color)
+        self.clicked.connect(self._pick)
+
+    def set_color(self, color):
+        self.color = QColor(color)
+        swatch = QPixmap(40, 14)
+        swatch.fill(self.color)
+        self.setIcon(QIcon(swatch))
+        self.setIconSize(swatch.size())
+        self.setText(self.color.name())
+
+    def _pick(self):
+        color = QColorDialog.getColor(self.color, self, self.title)
+        if color.isValid():
+            self.set_color(color)
+
+
+class SettingsDialog(QDialog):
+    """How new annotations look: text size and color, strikethrough /
+    underline color, highlight and note colors."""
+
+    COLORS = (("text_color", "Font color"), ("line_color", "Line color (strikethrough, underline)"),
+              ("highlight_color", "Highlight color"), ("note_color", "Note color"))
+
+    def __init__(self, style, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("nerdpdf settings")
+        form = QFormLayout(self)
+        self.text_size = QSpinBox(minimum=4, maximum=72, suffix=" pt", value=style["text_size"])
+        form.addRow("Font size", self.text_size)
+        self.buttons = {}
+        for key, label in self.COLORS:
+            self.buttons[key] = ColorButton(style[key], label, self)
+            form.addRow(label, self.buttons[key])
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        form.addRow(box)
+
+    def values(self):
+        return {"text_size": self.text_size.value(), **{k: b.color for k, b in self.buttons.items()}}
+
+
 class SearchLine(QLineEdit):
     search = Signal(str, bool)  # query, forward
     closed = Signal()
@@ -68,6 +132,7 @@ class MainWindow(QMainWindow):
         self._title_dir, self._title_names = None, []  # folder listing cached for the window title
 
         self.view = PdfView()
+        self.view.annot_style = load_annot_style(self.settings)
         # remembered zoom for regular documents; slides always open fitted to the page
         self.zoom_pref = (float(self.settings.value("zoom", 1.0)),
                           self.settings.value("fit_mode", "width") or None)
@@ -100,6 +165,7 @@ class MainWindow(QMainWindow):
         self._save_timer.timeout.connect(self.flush_edits)
         self.view.documentEdited.connect(self._edited)
         self.view.quitRequested.connect(self.close)
+        self.view.settingsRequested.connect(self.edit_settings)
         self.view.searchStep.connect(lambda forward: self._search(self.search_line.text(), forward))
         self.view.escapePressed.connect(self._escape)
         self.view.fullscreenRequested.connect(self.toggle_fullscreen)
@@ -250,6 +316,16 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------------- misc
 
+    def edit_settings(self):
+        dlg = SettingsDialog(self.view.annot_style, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        style = dlg.values()
+        for key, value in style.items():
+            self.settings.setValue(f"annotations/{key}", value.name() if isinstance(value, QColor) else value)
+        for win in getattr(QApplication.instance(), "windows", [self]):
+            win.view.annot_style = dict(style)
+
     def toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
@@ -299,8 +375,9 @@ KEYS = """keys:
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
   middle-drag      pan
-  right-click      PDFs: add a note or text, highlight, strike through or copy text
-                   (on one: edit / delete); saved to the file
+  right-click      PDFs: add a note or text; highlight, strike through, underline or
+                   copy text (on one: edit / delete); saved to the file.
+                   Settings: font size and colors of new annotations
   Shift+left-drag  PDFs: select text to copy it to the clipboard
   left-drag        move a note or text (double-click: edit it; hover a note to read it)"""
 

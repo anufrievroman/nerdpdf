@@ -26,11 +26,16 @@ SLIDE_RATIOS = (4 / 3, 16 / 10, 16 / 9)
 
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_HIT_COLOR = QColor(255, 140, 0, 170)
-SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through / copy
+SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through / underline / copy
 
-NOTE_COLOR = HIGHLIGHT_COLOR = QColor("#7cd9e7")  # sticky-note icons and highlights
-BLUE_TEXT, BLACK_TEXT = QColor("#1b67e4"), QColor("black")  # text added with right-click
-SMALL_TEXT, LARGE_TEXT = 8, 12  # pt
+# how new annotations look; MainWindow overrides these from the Settings dialog
+ANNOT_STYLE = {
+    "text_size": 8,  # pt, text added with right-click
+    "text_color": QColor("#1b67e4"),
+    "line_color": QColor("#1b67e4"),  # strikethrough and underline
+    "highlight_color": QColor("#7cd9e7"),
+    "note_color": QColor("#7cd9e7"),  # sticky-note icons
+}
 TEXT_FONT = "Helvetica"  # matches PyMuPDF's "helv", which the text is written with
 
 
@@ -121,6 +126,7 @@ class PdfView(QAbstractScrollArea):
     fileStep = Signal(int)  # images: paging past the first/last page moves this many files in the folder
     documentEdited = Signal()  # a note or text was added, changed or deleted; the file should be saved
     quitRequested = Signal()
+    settingsRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,6 +141,7 @@ class PdfView(QAbstractScrollArea):
         self.fit_cap = None  # images: fit page never enlarges beyond their natural size
         self.single_page = False  # show only self.page instead of the continuous feed
         self.page = 0  # the page shown in single-page mode
+        self.annot_style = dict(ANNOT_STYLE)
 
         self._cache = OrderedDict()  # page -> (scale, QImage) full-page renders
         self._cache_bytes = 0
@@ -150,7 +157,7 @@ class PdfView(QAbstractScrollArea):
         # (editor, page, x, y in displayed page points, xref of the text it replaces, size, color)
         self._text_edit = None
         self._annot_drag = None  # [page, xref, press position, displayed rect at press, moved yet]
-        self._mark = None  # "highlight" / "strike" / "copy": the next left drag selects text for that
+        self._mark = None  # "highlight" / "strike" / "underline" / "copy": the next left drag selects text for that
         self._select = None  # [page, words, first word, last word, pressed on a word] while selecting
         self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
         self._last_flip = 0.0
@@ -632,17 +639,16 @@ class PdfView(QAbstractScrollArea):
         menu = QMenu(self)
         if hit is None:
             menu.addAction("Add note", lambda: self._edit_note(i, x, y))
-            for name, color in (("blue", BLUE_TEXT), ("black", BLACK_TEXT)):
-                for label, size in (("small", SMALL_TEXT), ("large", LARGE_TEXT)):
-                    menu.addAction(f"Add {name} {label} text",
-                                   lambda size=size, color=color: self._start_text(i, x, y, size=size, color=color))
+            menu.addAction("Add text", lambda: self._start_text(i, x, y))
             menu.addSeparator()
             menu.addAction("Highlight text", lambda: self._start_mark("highlight"))
             menu.addAction("Strike through text", lambda: self._start_mark("strike"))
+            menu.addAction("Underline text", lambda: self._start_mark("underline"))
             menu.addAction("Select text to copy", lambda: self._start_mark("copy"))
             mark = self._mark_at(i, x, y)
             if mark:
-                name = "highlight" if mark[1] == pymupdf.PDF_ANNOT_HIGHLIGHT else "strikethrough"
+                name = {pymupdf.PDF_ANNOT_HIGHLIGHT: "highlight", pymupdf.PDF_ANNOT_STRIKE_OUT: "strikethrough",
+                        pymupdf.PDF_ANNOT_UNDERLINE: "underline"}[mark[1]]
                 menu.addAction(f"Delete {name}", lambda: self._delete_annot(i, mark[0]))
         elif hit[1] == pymupdf.PDF_ANNOT_TEXT:
             menu.addAction("Edit note", lambda: self._edit_note(i, x, y, hit[0]))
@@ -650,6 +656,8 @@ class PdfView(QAbstractScrollArea):
         else:
             menu.addAction("Edit text", lambda: self._start_text(i, xref=hit[0]))
             menu.addAction("Delete text", lambda: self._delete_annot(i, hit[0]))
+        menu.addSeparator()
+        menu.addAction("Settings...", self.settingsRequested.emit)
         menu.exec(self.viewport().mapToGlobal(pos.toPoint()))
 
     def _drop_render(self, i):
@@ -686,14 +694,15 @@ class PdfView(QAbstractScrollArea):
             annot.set_info(content=text)
         else:
             annot = page.add_text_annot(pymupdf.Point(x, y) * page.derotation_matrix, text)
-            annot.set_colors(stroke=_rgb(NOTE_COLOR))
+            annot.set_colors(stroke=_rgb(self.annot_style["note_color"]))
         annot.update()
         self._annotations_changed(i)
 
-    def _start_text(self, i, x=0.0, y=0.0, xref=0, size=LARGE_TEXT, color=BLUE_TEXT):
+    def _start_text(self, i, x=0.0, y=0.0, xref=0):
         """Open the inline editor for new text at (x, y), or for editing text xref in place."""
         self._finish_text()
         text = ""
+        size, color = self.annot_style["text_size"], self.annot_style["text_color"]
         if xref:
             page = self.doc[i]
             annot = page.load_annot(xref)
@@ -764,19 +773,20 @@ class PdfView(QAbstractScrollArea):
         self._annotations_changed(i)
 
     def _mark_at(self, i, x, y):
-        """(xref, type) of the topmost highlight or strikethrough over (x, y) on page i, or None."""
+        """(xref, type) of the topmost highlight, strikethrough or underline over (x, y) on page i, or None."""
         page = self.doc[i]
         pt = pymupdf.Point(x, y) * page.derotation_matrix
         found = None
-        for annot in page.annots(types=(pymupdf.PDF_ANNOT_HIGHLIGHT, pymupdf.PDF_ANNOT_STRIKE_OUT)):
+        for annot in page.annots(types=(pymupdf.PDF_ANNOT_HIGHLIGHT, pymupdf.PDF_ANNOT_STRIKE_OUT,
+                                              pymupdf.PDF_ANNOT_UNDERLINE)):
             v = annot.vertices  # 4 corners per marked line
             if any(pt in pymupdf.Quad(*v[k:k + 4]).rect for k in range(0, len(v), 4)):
                 found = annot.xref, annot.type[0]
         return found
 
     def _start_mark(self, kind):
-        """Context menu: the next left drag (or click on a word) highlights, strikes through or
-        copies text, kind "highlight", "strike" or "copy"; Esc cancels."""
+        """Context menu: the next left drag (or click on a word) highlights, strikes through,
+        underlines or copies text, kind "highlight", "strike", "underline" or "copy"; Esc cancels."""
         self._mark = kind
         self.viewport().setCursor(Qt.IBeamCursor)
 
@@ -835,7 +845,7 @@ class PdfView(QAbstractScrollArea):
         return "\n".join(" ".join(line) for line in lines.values())
 
     def _select_finish(self):
-        """Highlight, strike through or copy the selected text; a click off any word does nothing."""
+        """Highlight, strike through, underline or copy the selected text; a click off any word does nothing."""
         i, _, a, b, on_word = self._select
         lines, text, kind = self._selected_lines(), self._selected_text(), self._mark
         self._end_mark()
@@ -851,10 +861,11 @@ class PdfView(QAbstractScrollArea):
         quads = [r.quad for r in lines]
         if kind == "highlight":
             annot = page.add_highlight_annot(quads=quads)
-            annot.set_colors(stroke=_rgb(HIGHLIGHT_COLOR))
+            annot.set_colors(stroke=_rgb(self.annot_style["highlight_color"]))
         else:
-            annot = page.add_strikeout_annot(quads=quads)
-            annot.set_colors(stroke=_rgb(BLUE_TEXT))
+            add = page.add_underline_annot if kind == "underline" else page.add_strikeout_annot
+            annot = add(quads=quads)
+            annot.set_colors(stroke=_rgb(self.annot_style["line_color"]))
         annot.update()
         self._annotations_changed(i)
 
@@ -975,7 +986,7 @@ class PdfView(QAbstractScrollArea):
         self._finish_text()
         if ev.button() == Qt.RightButton:
             self._right_down = True
-            # a right click while selecting text to highlight / strike through only cancels that
+            # a right click while selecting text to highlight / strike through / underline only cancels that
             self._right_zoomed = bool(self._mark)
             self._end_mark()
             ev.accept()
