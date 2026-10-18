@@ -48,6 +48,9 @@ enlarged beyond their natural size. Zoom and panning work as usual; search and `
 Next / previous page (`J` `K`, `Space`, ...) and the wheel (even when zoomed in) step through
 the other images in the same folder (not subfolders), in natural name order.
 
+On macOS, files opened from Finder or dropped on the Dock icon open in a new window
+(`o` and dropping onto a window replace its document).
+
 Counts work like vim: `5j`, `3J`.
 
 Zoom / fit mode, window geometry and the last position in each file are remembered

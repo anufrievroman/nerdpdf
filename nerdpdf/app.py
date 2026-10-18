@@ -8,7 +8,7 @@ import sys
 from bisect import bisect_left
 
 import pymupdf
-from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QVBoxLayout, QWidget)
@@ -279,11 +279,48 @@ def parse_args(argv):
 class Application(QApplication):
     fileOpened = Signal(str)  # macOS Finder "Open With" / dropping on the Dock icon
 
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.windows = []
+        self.fileOpened.connect(self.open_file)
+
     def event(self, ev):
         if ev.type() == QEvent.FileOpen:
             self.fileOpened.emit(ev.file())
             return True
         return super().event(ev)
+
+    def new_window(self):
+        win = MainWindow()
+        win.setAttribute(Qt.WA_DeleteOnClose)
+        win.destroyed.connect(lambda: self.windows.remove(win))
+        active = self.activeWindow() or (self.windows[-1] if self.windows else None)
+        if active and not active.isFullScreen():  # cascade instead of stacking exactly on top
+            win.move(active.pos() + QPoint(30, 30))
+        self.windows.append(win)
+        win.show()
+        return win
+
+    def open_file(self, path):
+        """Open path in a new window; reuse an empty window, raise one already showing path."""
+        target = os.path.abspath(path)
+        for win in self.windows:
+            if win.path and os.path.abspath(win.path) == target:
+                win.raise_()
+                win.activateWindow()
+                return
+        empty = next((w for w in self.windows if not w.path), None)
+        if empty:
+            empty.open(path)
+            return
+        try:
+            doc = _load(path)
+        except Exception as e:
+            QMessageBox.warning(self.activeWindow(), "nerdpdf", f"Cannot open {path}:\n{e}")
+            return
+        win = self.new_window()
+        # show after the window is laid out so fit-width/position use the real viewport size
+        QTimer.singleShot(0, lambda: win._show(path, doc))
 
 
 def main():
@@ -296,9 +333,7 @@ def main():
     app = Application(sys.argv[:1])
     app.setApplicationName("nerdpdf")
     app.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "icons", "nerdpdf.png")))
-    win = MainWindow()
-    win.show()
-    app.fileOpened.connect(win.open)
+    win = app.new_window()
     if args.file:
         # open after the window is laid out so fit-width/position use the real viewport size
         QTimer.singleShot(0, lambda: win.open(args.file))
