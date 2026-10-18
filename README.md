@@ -34,7 +34,8 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `=` / `-` | zoom in / out |
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
-| right-click | PDFs: add a note or text there, or highlight / strike through text; on an existing one: edit / delete |
+| right-click | PDFs: add a note or text there, or highlight / strike through / copy text; on an existing one: edit / delete |
+| Shift + left-drag | PDFs: select text and copy it to the clipboard |
 | left-drag on a note or text | move it |
 | double-click on a note or text | edit it |
 | hover over a note | show its text |
@@ -68,6 +69,8 @@ The save is incremental: changes are appended to the end of the file.
 "Highlight text" and "Strike through text" turn the cursor into a text cursor: drag over text
 (or click a word) to highlight it or strike it through in blue; Esc or a right click cancels.
 Right-click highlighted or struck text to delete the highlight or strikethrough.
+"Select text to copy" (or Shift + left-drag, or Shift+click on a word) works the same way but
+copies the selected text to the clipboard, one line of text per line, without changing the PDF.
 
 Counts work like vim: `5j`, `3J`.
 

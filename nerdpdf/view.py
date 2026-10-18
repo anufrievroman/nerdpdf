@@ -9,7 +9,7 @@ from time import monotonic
 
 import pymupdf
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication, QImage, QImageReader,
+from PySide6.QtGui import (QClipboard, QColor, QFont, QFontMetricsF, QGuiApplication, QImage, QImageReader,
                            QPainter, QPalette)
 from PySide6.QtWidgets import (QAbstractScrollArea, QDialog, QDialogButtonBox, QMenu, QPlainTextEdit,
                                QToolTip, QVBoxLayout)
@@ -26,7 +26,7 @@ SLIDE_RATIOS = (4 / 3, 16 / 10, 16 / 9)
 
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_HIT_COLOR = QColor(255, 140, 0, 170)
-SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through
+SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through / copy
 
 NOTE_COLOR = HIGHLIGHT_COLOR = QColor("#7cd9e7")  # sticky-note icons and highlights
 BLUE_TEXT, BLACK_TEXT = QColor("#1b67e4"), QColor("black")  # text added with right-click
@@ -150,7 +150,7 @@ class PdfView(QAbstractScrollArea):
         # (editor, page, x, y in displayed page points, xref of the text it replaces, size, color)
         self._text_edit = None
         self._annot_drag = None  # [page, xref, press position, displayed rect at press, moved yet]
-        self._mark = None  # "highlight" / "strike": the next left drag selects text to mark that way
+        self._mark = None  # "highlight" / "strike" / "copy": the next left drag selects text for that
         self._select = None  # [page, words, first word, last word, pressed on a word] while selecting
         self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
         self._last_flip = 0.0
@@ -639,6 +639,7 @@ class PdfView(QAbstractScrollArea):
             menu.addSeparator()
             menu.addAction("Highlight text", lambda: self._start_mark("highlight"))
             menu.addAction("Strike through text", lambda: self._start_mark("strike"))
+            menu.addAction("Select text to copy", lambda: self._start_mark("copy"))
             mark = self._mark_at(i, x, y)
             if mark:
                 name = "highlight" if mark[1] == pymupdf.PDF_ANNOT_HIGHLIGHT else "strikethrough"
@@ -774,8 +775,8 @@ class PdfView(QAbstractScrollArea):
         return found
 
     def _start_mark(self, kind):
-        """Context menu: the next left drag (or click on a word) highlights or strikes through
-        text, kind "highlight" or "strike"; Esc cancels."""
+        """Context menu: the next left drag (or click on a word) highlights, strikes through or
+        copies text, kind "highlight", "strike" or "copy"; Esc cancels."""
         self._mark = kind
         self.viewport().setCursor(Qt.IBeamCursor)
 
@@ -825,12 +826,26 @@ class PdfView(QAbstractScrollArea):
             lines[key] = lines[key] | r if key in lines else r
         return list(lines.values())
 
+    def _selected_text(self):
+        """Selected words, one text line per line."""
+        _, words, a, b, _ = self._select
+        lines = {}
+        for w in words[min(a, b):max(a, b) + 1]:
+            lines.setdefault((w[5], w[6]), []).append(w[4])
+        return "\n".join(" ".join(line) for line in lines.values())
+
     def _select_finish(self):
-        """Highlight or strike through the selected text; a click off any word marks nothing."""
+        """Highlight, strike through or copy the selected text; a click off any word does nothing."""
         i, _, a, b, on_word = self._select
-        lines, kind = self._selected_lines(), self._mark
+        lines, text, kind = self._selected_lines(), self._selected_text(), self._mark
         self._end_mark()
         if a == b and not on_word:
+            return
+        if kind == "copy":
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(text)
+            if clipboard.supportsSelection():  # X11 / Wayland: middle-click paste too
+                clipboard.setText(text, QClipboard.Selection)
             return
         page = self.doc[i]  # the annotation only works while its page object is alive
         quads = [r.quad for r in lines]
@@ -970,6 +985,8 @@ class PdfView(QAbstractScrollArea):
             self.viewport().setCursor(Qt.ClosedHandCursor)
             ev.accept()
             return
+        if ev.button() == Qt.LeftButton and ev.modifiers() & Qt.ShiftModifier and not self._mark:
+            self._start_mark("copy")
         if ev.button() == Qt.LeftButton and self._mark:
             self._select_start(ev.position())
             ev.accept()

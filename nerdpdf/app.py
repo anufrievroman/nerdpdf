@@ -299,8 +299,9 @@ KEYS = """keys:
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
   middle-drag      pan
-  right-click      PDFs: add a note or text, highlight or strike through text
+  right-click      PDFs: add a note or text, highlight, strike through or copy text
                    (on one: edit / delete); saved to the file
+  Shift+left-drag  PDFs: select text to copy it to the clipboard
   left-drag        move a note or text (double-click: edit it; hover a note to read it)"""
 
 
