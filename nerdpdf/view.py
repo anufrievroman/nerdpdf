@@ -664,6 +664,8 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
             self.scroll_by(-round(d.x()), -round(d.y()))
             ev.accept()
             return
+        if ev.buttons() == Qt.NoButton:
+            self._hover(ev.position())
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):

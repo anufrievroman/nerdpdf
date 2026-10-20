@@ -6,7 +6,7 @@ Minimal keyboard-driven PDF and image viewer.
 
 - Supports Vim keys
 - Opens PDF files and images alike
-- Can add notes, text, highlights etc to PDF documents
+- Can add notes, text, images (e.g. signatures), highlights etc to PDF documents
 - Smart defaults depending on PDF type (slide or document)
 - Can view all images in the folder
 
@@ -40,9 +40,10 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | `=` (`+`) / `-` | zoom in / out |
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
-| right-click | PDFs: add a note or text there, or highlight / strike through / underline / copy text; Settings; on an existing one only edit / delete it (marked text: delete the marks) |
+| right-click | PDFs: add a note, text or image there, or highlight / strike through / underline / copy text; Settings; on an existing one only edit / delete it (marked text: delete the marks; images: bigger / smaller) |
 | Shift + left-drag | PDFs: select text and copy it to the clipboard |
-| left-drag on a note or text | move it |
+| left-drag on a note, text or image | move it |
+| left-drag on an image's bottom-right corner | resize it |
 | double-click on a note or text | edit it |
 | hover over a note | show its text |
 | `/` | search: Enter finds, then `n` / `N` = next / previous match, Esc = close |

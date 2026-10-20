@@ -329,11 +329,12 @@ KEYS = """keys:
   f F              toggle fullscreen (Esc leaves)
   o q              open file / quit
   middle-drag      pan
-  right-click      PDFs: add a note or text; highlight, strike through, underline or
-                   copy text (on one only: edit / delete); saved to the file.
+  right-click      PDFs: add a note, text or image; highlight, strike through, underline or
+                   copy text (on one only: edit / delete; images: bigger / smaller); saved to the file.
                    Settings: font size and colors of new annotations, inverted page color
   Shift+left-drag  PDFs: select text to copy it to the clipboard
-  left-drag        move a note or text (double-click: edit it; hover a note to read it)"""
+  left-drag        move a note, text or image (double-click: edit it; hover a note to read it);
+                   dragging an image's bottom-right corner resizes it"""
 
 
 def parse_args(argv):

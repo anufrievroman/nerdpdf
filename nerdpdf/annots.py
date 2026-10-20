@@ -1,14 +1,14 @@
-"""PDF annotations (notes, text, highlight / strikethrough / underline, copying text) and their settings."""
+"""PDF annotations (notes, text, images, highlight / strikethrough / underline, copying text) and their settings."""
 
 import re
 from html import escape
 
 import pymupdf
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QPointF, Qt, Signal
 from PySide6.QtGui import (QClipboard, QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon,
-                           QPixmap)
-from PySide6.QtWidgets import (QColorDialog, QDialog, QDialogButtonBox, QFormLayout, QMenu, QPlainTextEdit,
-                               QPushButton, QSpinBox, QToolTip, QVBoxLayout)
+                           QImageReader, QPixmap, QTransform)
+from PySide6.QtWidgets import (QColorDialog, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QMenu,
+                               QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QToolTip, QVBoxLayout)
 
 SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through / underline / copy
 
@@ -21,6 +21,10 @@ ANNOT_STYLE = {
     "note_color": QColor("#7cd9e7"),  # sticky-note icons
 }
 TEXT_FONT = "Helvetica"  # matches PyMuPDF's "helv", which the text is written with
+
+IMAGE_STAMP = "ImageStamp"  # /Name of the stamp annotations PyMuPDF makes from images
+RESIZE_GRIP = 12  # px at the bottom-right corner of an image that resize it when dragged
+IMAGE_STEP = 1.25  # Bigger / Smaller in the context menu
 
 MARK_NAMES = {pymupdf.PDF_ANNOT_HIGHLIGHT: "highlight", pymupdf.PDF_ANNOT_STRIKE_OUT: "strikethrough",
               pymupdf.PDF_ANNOT_UNDERLINE: "underline"}
@@ -54,6 +58,18 @@ class _TextEditor(_EnterEdit):
     def focusOutEvent(self, ev):
         super().focusOutEvent(ev)
         self.done.emit()
+
+
+def _image_bytes(img):
+    """QImage -> PNG bytes if it has transparency (signatures), else JPEG (photos stay small)."""
+    data = QByteArray()
+    buf = QBuffer(data)
+    buf.open(QBuffer.WriteOnly)
+    if img.hasAlphaChannel():
+        img.save(buf, "PNG")
+    else:
+        img.save(buf, "JPEG", 90)
+    return bytes(data)
 
 
 def _ask_note(parent, text):
@@ -155,7 +171,10 @@ class AnnotationsMixin:
         self.annot_style = dict(ANNOT_STYLE)
         # (editor, page, x, y in displayed page points, xref of the text it replaces, size, color)
         self._text_edit = None
-        self._annot_drag = None  # [page, xref, press position, displayed rect at press, moved yet]
+        # [page, xref, press position, displayed rect at press, moved yet, resizing (an image's corner)]
+        self._annot_drag = None
+        self._grip_hover = False  # the cursor shows that an image's corner can be dragged
+        self.viewport().setMouseTracking(True)
         self._mark = None  # "highlight" / "strike" / "underline" / "copy": the next left drag selects text for that
         self._select = None  # [page, words, first word, last word, pressed on a word] while selecting
 
@@ -170,7 +189,7 @@ class AnnotationsMixin:
         return i, x, y
 
     def _annot_at(self, i, x, y):
-        """Topmost note or text annotation under (x, y) on page i, or None.
+        """Topmost note, text or image annotation under (x, y) on page i, or None.
 
         Returns (xref, type, rect in displayed page points, text). Annotation objects stop
         working once their page object is gone, so callers keep the xref and reload the
@@ -179,13 +198,17 @@ class AnnotationsMixin:
         page = self.doc[i]
         pt = pymupdf.Point(x, y) * page.derotation_matrix
         found = None
-        for annot in page.annots(types=(pymupdf.PDF_ANNOT_TEXT, pymupdf.PDF_ANNOT_FREE_TEXT)):
+        kinds = (pymupdf.PDF_ANNOT_TEXT, pymupdf.PDF_ANNOT_FREE_TEXT, pymupdf.PDF_ANNOT_STAMP)
+        for annot in page.annots(types=kinds):
+            # other stamps keep their own appearance, which moving them would replace
+            if annot.type[0] == pymupdf.PDF_ANNOT_STAMP and annot.info["name"] != IMAGE_STAMP:
+                continue
             if pt in annot.rect:
                 found = annot.xref, annot.type[0], annot.rect * page.rotation_matrix, annot.info["content"]
         return found
 
     def _annot_under(self, pos):
-        """(page, x, y, _annot_at result) for the note or text under viewport point pos, or None."""
+        """(page, x, y, _annot_at result) for the note, text or image under viewport point pos, or None."""
         hit = self._page_hit(pos)
         found = hit and self._annot_at(*hit)
         return (*hit, found) if found else None
@@ -211,7 +234,7 @@ class AnnotationsMixin:
         font = QFontDatabase.systemFont(QFontDatabase.FixedFont)  # monospace so the symbols line up
         font.setPointSizeF(menu.font().pointSizeF())
         menu.setFont(font)
-        # on a note, text or marked text the menu only edits / deletes it; Settings is on the plain page menu
+        # on a note, text, image or marked text the menu only edits / deletes it; Settings is on the plain page menu
         marks = self._marks_at(i, x, y) if hit is None else []
         if marks:
             for xref, kind in marks:
@@ -219,6 +242,7 @@ class AnnotationsMixin:
         elif hit is None:
             menu.addAction("□  Add note", lambda: self._edit_note(i, x, y))
             menu.addAction("T  Add text", lambda: self._start_text(i, x, y))
+            menu.addAction("▣  Add image...", lambda: self._add_image(i, x, y))
             menu.addSeparator()
             menu.addAction("▬  Highlight text", lambda: self._start_mark("highlight"))
             menu.addAction("S̶  Strike through text", lambda: self._start_mark("strike"))
@@ -229,6 +253,10 @@ class AnnotationsMixin:
         elif hit[1] == pymupdf.PDF_ANNOT_TEXT:
             menu.addAction("✎  Edit note", lambda: self._edit_note(i, x, y, hit[0]))
             menu.addAction("✕  Delete note", lambda: self._delete_annot(i, hit[0]))
+        elif hit[1] == pymupdf.PDF_ANNOT_STAMP:
+            menu.addAction("+  Bigger", lambda: self._scale_image(i, hit[0], IMAGE_STEP))
+            menu.addAction("−  Smaller", lambda: self._scale_image(i, hit[0], 1 / IMAGE_STEP))
+            menu.addAction("✕  Delete image", lambda: self._delete_annot(i, hit[0]))
         else:
             menu.addAction("✎  Edit text", lambda: self._start_text(i, xref=hit[0]))
             menu.addAction("✕  Delete text", lambda: self._delete_annot(i, hit[0]))
@@ -338,10 +366,68 @@ class AnnotationsMixin:
                                     text_color=_rgb(color), rotate=page.rotation)
         self._annotations_changed(i)
 
+    # ---------------------------------------------------------------- images
+
+    def _add_image(self, i, x, y):
+        """Ask for an image file and put it on page i with its top-left corner at (x, y).
+
+        It becomes an image stamp annotation, so it can be moved, resized and deleted like the others.
+        """
+        formats = " ".join(f"*.{bytes(f).decode()}" for f in QImageReader.supportedImageFormats())
+        path, _ = QFileDialog.getOpenFileName(self, "Add image", "", f"Images ({formats})")
+        if not path:
+            return
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)  # phone photos: EXIF orientation
+        img = reader.read()
+        if img.isNull():
+            QMessageBox.warning(self, "nerdpdf", f"Cannot read {path}: {reader.errorString()}")
+            return
+        page = self.doc[i]
+        img = img.transformed(QTransform().rotate(-page.rotation))  # upright on a rotated page
+        # natural size at 96 dpi, but at most a third of the page (signature scans can be huge)
+        w, h = self.sizes[i]
+        iw, ih = (img.height(), img.width()) if page.rotation % 180 else (img.width(), img.height())
+        s = min(0.75, w / 3 / iw, h / 3 / ih)
+        iw, ih = iw * s, ih * s
+        x, y = min(x, w - iw), min(y, h - ih)
+        page.add_stamp_annot(pymupdf.Rect(x, y, x + iw, y + ih) * page.derotation_matrix, _image_bytes(img))
+        self._annotations_changed(i)
+
+    def _scale_image(self, i, xref, factor):
+        """Context menu: make image xref bigger or smaller, keeping its top-left corner and the page."""
+        page = self.doc[i]
+        annot = page.load_annot(xref)
+        r = annot.rect * page.rotation_matrix
+        w, h = self.sizes[i]
+        factor = min(factor, (w - r.x0) / r.width, (h - r.y0) / r.height)
+        annot.set_rect(pymupdf.Rect(r.x0, r.y0, r.x0 + r.width * factor, r.y0 + r.height * factor)
+                       * page.derotation_matrix)
+        annot.update()
+        self._annotations_changed(i)
+
+    def _on_grip(self, pos):
+        """(page, xref, displayed rect) if pos is on the bottom-right corner of an image, else None."""
+        under = self._annot_under(pos)
+        if not under or under[3][1] != pymupdf.PDF_ANNOT_STAMP:
+            return None
+        i, _, _, (xref, _, rect, _) = under
+        corner = self._view_rect(i, rect).bottomRight()
+        if corner.x() - pos.x() > RESIZE_GRIP or corner.y() - pos.y() > RESIZE_GRIP:
+            return None
+        return i, xref, rect
+
+    def _hover(self, pos):
+        """Mouse moving with no button down: a resize cursor over an image's corner."""
+        grip = not self._mark and self._on_grip(pos) is not None
+        if grip != self._grip_hover:
+            self._grip_hover = grip
+            self.viewport().setCursor(Qt.SizeFDiagCursor) if grip else self.viewport().unsetCursor()
+
     def _open_annot(self, pos):
         """Double click: edit the note or text under pos. Returns False if there is none."""
         under = self._annot_under(pos)
-        if not under:
+        if not under or under[3][1] == pymupdf.PDF_ANNOT_STAMP:
             return False
         i, x, y, (xref, kind, _, _) = under
         if kind == pymupdf.PDF_ANNOT_TEXT:
@@ -363,30 +449,43 @@ class AnnotationsMixin:
     # ------------------------------------------------------------- dragging
 
     def _start_drag(self, pos):
-        """Left press: start dragging the note or text under pos. Returns False if there is none."""
+        """Left press: start dragging the note, text or image under pos (an image's corner
+        resizes it). Returns False if there is none."""
+        grip = self._on_grip(pos)
+        if grip:
+            self._annot_drag = [*grip[:2], pos, grip[2], False, True]
+            return True
         under = self._annot_under(pos)
         if not under:
             return False
         i, _, _, (xref, _, rect, _) = under
-        self._annot_drag = [i, xref, pos, rect, False]
+        self._annot_drag = [i, xref, pos, rect, False, False]
         return True
 
     def _drag_to(self, pos):
-        """Move the dragged annotation with the mouse, keeping it on its page.
+        """Move the dragged annotation with the mouse, or resize the image, keeping it on its page
+        (and an image's aspect ratio).
 
         The page is re-rendered on every move (a few ms); the file is saved on release.
         """
-        i, xref, start, r0, moved = self._annot_drag
+        i, xref, start, r0, moved, resizing = self._annot_drag
         if not moved and (pos - start).manhattanLength() < QGuiApplication.styleHints().startDragDistance():
             return
         self._annot_drag[4] = True
-        self.viewport().setCursor(Qt.ClosedHandCursor)
+        self.viewport().setCursor(Qt.SizeFDiagCursor if resizing else Qt.ClosedHandCursor)
         w, h = self.sizes[i]
-        x = max(0.0, min(r0.x0 + (pos.x() - start.x()) / self.zoom, w - r0.width))
-        y = max(0.0, min(r0.y0 + (pos.y() - start.y()) / self.zoom, h - r0.height))
+        dx, dy = (pos.x() - start.x()) / self.zoom, (pos.y() - start.y()) / self.zoom
+        if resizing:
+            s = max((r0.width + dx) / r0.width, (r0.height + dy) / r0.height)
+            s = max(8 / min(r0.width, r0.height), min(s, (w - r0.x0) / r0.width, (h - r0.y0) / r0.height))
+            new = pymupdf.Rect(r0.x0, r0.y0, r0.x0 + r0.width * s, r0.y0 + r0.height * s)
+        else:
+            x = max(0.0, min(r0.x0 + dx, w - r0.width))
+            y = max(0.0, min(r0.y0 + dy, h - r0.height))
+            new = pymupdf.Rect(x, y, x + r0.width, y + r0.height)
         page = self.doc[i]
         annot = page.load_annot(xref)
-        annot.set_rect(pymupdf.Rect(x, y, x + r0.width, y + r0.height) * page.derotation_matrix)
+        annot.set_rect(new * page.derotation_matrix)
         annot.update()
         self._uncache(i)
         self.viewport().update()
@@ -394,6 +493,7 @@ class AnnotationsMixin:
     def _end_drag(self):
         i, moved = self._annot_drag[0], self._annot_drag[4]
         self._annot_drag = None
+        self._grip_hover = False
         self.viewport().unsetCursor()
         if moved:
             self._annotations_changed(i)
@@ -404,6 +504,7 @@ class AnnotationsMixin:
         """Context menu: the next left drag (or click on a word) highlights, strikes through,
         underlines or copies text, kind "highlight", "strike", "underline" or "copy"; Esc cancels."""
         self._mark = kind
+        self._grip_hover = False
         self.viewport().setCursor(Qt.IBeamCursor)
 
     def _end_mark(self):
