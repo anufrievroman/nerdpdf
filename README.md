@@ -10,6 +10,8 @@ Minimal keyboard-driven PDF and image viewer.
 - Smart defaults depending on PDF type (slide or document)
 - Can view all images in the folder
 
+<p align="center"><img src="screenshot.jpg" alt="nerdpdf screenshot"></p>
+
 ## Installation
 
     pipx install git+https://github.com/anufrievroman/nerdpdf
