@@ -1,4 +1,4 @@
-<p align="center"><img src="nerdpdf/icons/nerdpdf.png" width="160" alt="nerdpdf icon"></p>
+<img src="nerdpdf/icons/nerdpdf.png" width="160" alt="nerdpdf icon">
 
 # NerdPDF
 
