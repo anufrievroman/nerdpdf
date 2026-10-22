@@ -270,6 +270,7 @@ class MainWindow(QMainWindow):
             win.view.annot_style = dict(style)
             if dark != win.view.dark_color:
                 win.view.set_inverted(win.view.inverted, dark)
+            win.view.viewport().update()  # measurements take the new color
 
     def toggle_inverted(self):
         """R: invert colors in all windows; remembered for next time."""
@@ -331,7 +332,9 @@ KEYS = """keys:
   middle-drag      pan
   right-click      PDFs: add a note, text or image; highlight, strike through, underline or
                    copy text (on one only: edit / delete; images: bigger / smaller); saved to the file.
-                   Settings: font size and colors of new annotations, inverted page color
+                   Settings: font size and colors of new annotations and measurements, inverted page color
+                   Measure (PDFs and images): set a scale, then measure length, angle or radius
+                   by dragging; Esc leaves the tool; measurements are not saved to the file
   Shift+left-drag  PDFs: select text to copy it to the clipboard
   left-drag        move a note, text or image (double-click: edit it; hover a note to read it);
                    dragging an image's bottom-right corner resizes it"""

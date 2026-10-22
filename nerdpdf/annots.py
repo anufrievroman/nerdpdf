@@ -5,10 +5,12 @@ from html import escape
 
 import pymupdf
 from PySide6.QtCore import QBuffer, QByteArray, QPointF, Qt, Signal
-from PySide6.QtGui import (QClipboard, QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon,
+from PySide6.QtGui import (QClipboard, QColor, QFont, QFontMetricsF, QGuiApplication, QIcon,
                            QImageReader, QPixmap, QTransform)
 from PySide6.QtWidgets import (QColorDialog, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QToolTip, QVBoxLayout)
+
+from .icons_ui import add_action
 
 SELECT_COLOR = QColor(27, 103, 228, 60)  # text being selected to highlight / strike through / underline / copy
 
@@ -19,6 +21,7 @@ ANNOT_STYLE = {
     "line_color": QColor("#1b67e4"),  # strikethrough and underline
     "highlight_color": QColor("#7cd9e7"),
     "note_color": QColor("#7cd9e7"),  # sticky-note icons
+    "measure_color": QColor("#8ff0c0"),  # light surf green: scale, lengths, angles and radii
 }
 TEXT_FONT = "Helvetica"  # matches PyMuPDF's "helv", which the text is written with
 
@@ -100,7 +103,7 @@ def load_annot_style(settings):
         style["text_size"] = int(settings.value("annotations/text_size", style["text_size"]))
     except (TypeError, ValueError):
         pass
-    for key in ("text_color", "line_color", "highlight_color", "note_color"):
+    for key in ("text_color", "line_color", "highlight_color", "note_color", "measure_color"):
         color = QColor(str(settings.value(f"annotations/{key}", "")))
         if color.isValid():
             style[key] = color
@@ -132,10 +135,11 @@ class ColorButton(QPushButton):
 
 class SettingsDialog(QDialog):
     """How new annotations look: text size and color, strikethrough /
-    underline color, highlight and note colors; and the page color with inverted colors."""
+    underline color, highlight and note colors; the measurement color; and the page color with inverted colors."""
 
     COLORS = (("text_color", "Font color"), ("line_color", "Line color (strikethrough, underline)"),
-              ("highlight_color", "Highlight color"), ("note_color", "Note color"))
+              ("highlight_color", "Highlight color"), ("note_color", "Note color"),
+              ("measure_color", "Measurement color"))
 
     def __init__(self, style, dark_color, parent=None):
         super().__init__(parent)
@@ -224,42 +228,58 @@ class AnnotationsMixin:
                 found.append((annot.xref, annot.type[0]))
         return found
 
+    def _on_page(self, pos):
+        """True if viewport point pos is on a page of the document, PDF or not."""
+        if not self.doc:
+            return False
+        i, x, y = self._locate(pos)
+        w, h = self.sizes[i]
+        return 0 <= x <= w and 0 <= y <= h
+
     def _context_menu(self, pos):
+        measured = self._measure_hit(pos)
         hit = self._page_hit(pos)
-        if hit is None:
+        if not measured and hit is None and not self._on_page(pos):
+            return
+        menu = QMenu(self)
+        if measured:  # on a measurement the menu only edits / deletes it
+            self._measure_menu(menu, measured)
+            menu.exec(self.viewport().mapToGlobal(pos.toPoint()))
+            return
+        if hit is None:  # an image: only measuring
+            self._add_measure_menu(menu)
+            menu.exec(self.viewport().mapToGlobal(pos.toPoint()))
             return
         i, x, y = hit
         hit = self._annot_at(i, x, y)
-        menu = QMenu(self)
-        font = QFontDatabase.systemFont(QFontDatabase.FixedFont)  # monospace so the symbols line up
-        font.setPointSizeF(menu.font().pointSizeF())
-        menu.setFont(font)
         # on a note, text, image or marked text the menu only edits / deletes it; Settings is on the plain page menu
         marks = self._marks_at(i, x, y) if hit is None else []
         if marks:
             for xref, kind in marks:
-                menu.addAction(f"✕  Delete {MARK_NAMES[kind]}", lambda xref=xref: self._delete_annot(i, xref))
+                add_action(menu, "delete", f"Delete {MARK_NAMES[kind]}", lambda xref=xref: self._delete_annot(i, xref))
         elif hit is None:
-            menu.addAction("□  Add note", lambda: self._edit_note(i, x, y))
-            menu.addAction("T  Add text", lambda: self._start_text(i, x, y))
-            menu.addAction("▣  Add image...", lambda: self._add_image(i, x, y))
+            add_action(menu, "note", "Add note", lambda: self._edit_note(i, x, y))
+            add_action(menu, "text", "Add text", lambda: self._start_text(i, x, y))
+            add_action(menu, "image", "Add image...", lambda: self._add_image(i, x, y))
             menu.addSeparator()
-            menu.addAction("▬  Highlight text", lambda: self._start_mark("highlight"))
-            menu.addAction("S̶  Strike through text", lambda: self._start_mark("strike"))
-            menu.addAction("▁  Underline text", lambda: self._start_mark("underline"))
-            menu.addAction("◫  Select text to copy", lambda: self._start_mark("copy"))
+            add_action(menu, "highlight", "Highlight text", lambda: self._start_mark("highlight"))
+            add_action(menu, "strike", "Strike through text", lambda: self._start_mark("strike"))
+            add_action(menu, "underline", "Underline text", lambda: self._start_mark("underline"))
+            add_action(menu, "select", "Select text to copy", lambda: self._start_mark("copy"))
             menu.addSeparator()
-            menu.addAction("⚙  Settings...", self.settingsRequested.emit)
+            self._add_measure_menu(menu)
+            menu.addSeparator()
+            add_action(menu, "settings", "Settings...", self.settingsRequested.emit)
         elif hit[1] == pymupdf.PDF_ANNOT_TEXT:
-            menu.addAction("✎  Edit note", lambda: self._edit_note(i, x, y, hit[0]))
-            menu.addAction("✕  Delete note", lambda: self._delete_annot(i, hit[0]))
+            add_action(menu, "edit", "Edit note", lambda: self._edit_note(i, x, y, hit[0]))
+            add_action(menu, "delete", "Delete note", lambda: self._delete_annot(i, hit[0]))
         elif hit[1] == pymupdf.PDF_ANNOT_STAMP:
-            menu.addAction("+  Bigger", lambda: self._scale_image(i, hit[0], IMAGE_STEP))
-            menu.addAction("−  Smaller", lambda: self._scale_image(i, hit[0], 1 / IMAGE_STEP))
-            menu.addAction("✕  Delete image", lambda: self._delete_annot(i, hit[0]))
+            add_action(menu, "bigger", "Bigger", lambda: self._scale_image(i, hit[0], IMAGE_STEP))
+            add_action(menu, "smaller", "Smaller", lambda: self._scale_image(i, hit[0], 1 / IMAGE_STEP))
+            add_action(menu, "delete", "Delete image", lambda: self._delete_annot(i, hit[0]))
         else:
-            menu.addAction("✎  Edit text", lambda: self._start_text(i, xref=hit[0]))
-            menu.addAction("✕  Delete text", lambda: self._delete_annot(i, hit[0]))
+            add_action(menu, "edit", "Edit text", lambda: self._start_text(i, xref=hit[0]))
+            add_action(menu, "delete", "Delete text", lambda: self._delete_annot(i, hit[0]))
         menu.exec(self.viewport().mapToGlobal(pos.toPoint()))
 
     def _annotations_changed(self, i):

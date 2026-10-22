@@ -7,6 +7,7 @@ Minimal keyboard-driven PDF and image viewer.
 - Supports Vim keys
 - Opens PDF files and images alike
 - Can add notes, text, images (e.g. signatures), highlights etc to PDF documents
+- Can measure lengths, angles and radii in PDFs and images, in real units after setting a scale
 - Smart defaults depending on PDF type (slide or document)
 - Can view all images in the folder
 
@@ -43,6 +44,7 @@ On macOS, also add it to Applications (Spotlight, Dock, Finder's "Open With"):
 | middle-button drag | pan the document |
 | right button + wheel, Shift+wheel, Cmd/Ctrl+wheel, pinch | zoom at the cursor |
 | right-click | PDFs: add a note, text or image there, or highlight / strike through / underline / copy text; Settings; on an existing one only edit / delete it (marked text: delete the marks; images: bigger / smaller) |
+| right-click → Measure | PDFs and images: Set scale (draw a line of known length, type its real length), then Measure length / angle / radius by dragging (Shift = 45° steps; an angle takes a drag for the first arm and a click for the second). Drag a handle or the line to edit; the scale line can be changed and everything follows. Right-click a measurement to delete it, `Esc` or right-click cancels / leaves the tool. Measurements are not saved in the file |
 | Shift + left-drag | PDFs: select text and copy it to the clipboard |
 | left-drag on a note, text or image | move it |
 | left-drag on an image's bottom-right corner | resize it |

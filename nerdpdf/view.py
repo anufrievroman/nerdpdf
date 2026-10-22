@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor, QGuiApplication, QImage, QImageReader, QPainte
 from PySide6.QtWidgets import QAbstractScrollArea
 
 from .annots import AnnotationsMixin
+from .measure import MeasureMixin
 
 GAP = 12  # px between pages and around the document
 MIN_ZOOM, MAX_ZOOM = 0.1, 12.0
@@ -55,7 +56,7 @@ def looks_like_slides(doc):
     return r.height > 0 and any(abs(r.width / r.height - k) / k < 0.02 for k in SLIDE_RATIOS)
 
 
-class PdfView(AnnotationsMixin, QAbstractScrollArea):
+class PdfView(MeasureMixin, AnnotationsMixin, QAbstractScrollArea):
     stateChanged = Signal()  # page or zoom changed
     searchRequested = Signal()
     searchStep = Signal(bool)  # n/N while a search is active; True = forward
@@ -96,6 +97,7 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         self._right_down = False  # right button held: the wheel zooms
         self._right_zoomed = False  # the wheel zoomed while the right button was held: no context menu
         self._init_annotations()
+        self._init_measure()
         self._wheel_acc = 0  # wheel delta pushed against the page edge in single-page mode
         self._last_flip = 0.0
 
@@ -120,6 +122,7 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
     def set_document(self, doc):
         self.finish_text()
         self._end_mark()
+        self._reset_measure()
         self.doc = doc
         self.sizes = [(p.rect.width, p.rect.height) for p in doc]
         self._uncache()
@@ -557,6 +560,7 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
                 p.drawImage(rect, cached[1])
             self._paint_hits(p, i)
             self._paint_selection(p, i)
+            self._paint_measures(p, i)
         if stale:
             self._render_timer.start()
 
@@ -628,6 +632,11 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         self.finish_text()
         if ev.button() == Qt.RightButton:
             self._right_down = True
+            if self._m_draw:  # a right click while drawing a measurement only cancels it
+                self._cancel_draw()
+                self._right_zoomed = True
+                ev.accept()
+                return
             # a right click while selecting text to highlight / strike through / underline only cancels that
             self._right_zoomed = bool(self._mark)
             self._end_mark()
@@ -636,6 +645,9 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         if ev.button() == Qt.MiddleButton:
             self._drag_from = ev.position()
             self.viewport().setCursor(Qt.ClosedHandCursor)
+            ev.accept()
+            return
+        if ev.button() == Qt.LeftButton and self._measure_press(ev):
             ev.accept()
             return
         if ev.button() == Qt.LeftButton and ev.modifiers() & Qt.ShiftModifier and not self._mark:
@@ -650,6 +662,9 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._measure_move(ev):
+            ev.accept()
+            return
         if self._select:
             self._select_to(ev.position())
             ev.accept()
@@ -680,6 +695,9 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
             self.viewport().setCursor(Qt.IBeamCursor) if self._mark else self.viewport().unsetCursor()
             ev.accept()
             return
+        if ev.button() == Qt.LeftButton and self._measure_release(ev):
+            ev.accept()
+            return
         if ev.button() == Qt.LeftButton and self._select:
             self._select_finish()
             ev.accept()
@@ -707,6 +725,8 @@ class PdfView(AnnotationsMixin, QAbstractScrollArea):
 
     def keyPressEvent(self, ev):
         t, key = ev.text(), ev.key()
+        if key == Qt.Key_Escape and self._cancel_measure():
+            return
         if key == Qt.Key_Escape and self._mark:
             self._end_mark()
             return
