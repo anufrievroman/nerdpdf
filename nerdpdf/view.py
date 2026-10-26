@@ -123,7 +123,7 @@ class PdfView(MeasureMixin, AnnotationsMixin, QAbstractScrollArea):
         self.finish_text()
         self._end_mark()
         self._reset_measure()
-        self.doc = doc
+        self._adopt(doc)
         self.sizes = [(p.rect.width, p.rect.height) for p in doc]
         self._uncache()
         self.clear_search()
@@ -141,11 +141,18 @@ class PdfView(MeasureMixin, AnnotationsMixin, QAbstractScrollArea):
         self.viewport().update()
         self.stateChanged.emit()
 
+    def _adopt(self, doc):
+        """Take ownership of doc and close the one it replaces, so no stale copy can be saved later."""
+        old = getattr(self, "doc", None)
+        self.doc = doc
+        if old is not None and old is not doc and not old.is_closed:
+            old.close()
+
     def reload_document(self, doc):
         """Swap in a reopened copy of the same file, keeping mode, zoom, position and search."""
         self.finish_text()
         self._end_mark()
-        self.doc = doc
+        self._adopt(doc)
         self._uncache()
         self._hits.clear()
         self.viewport().update()

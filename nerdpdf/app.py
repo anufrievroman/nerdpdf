@@ -29,11 +29,22 @@ def _natural_key(name):
     return [(0, int(s), "") if s.isdigit() else (1, 0, s) for s in re.split(r"(\d+)", name.lower())]
 
 
+def _file_id(path):
+    """Identity of the bytes on disk, or None if unreadable; compared to detect a file replaced under us."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
 def _load(path):
     """Open a document, failing here (not on first paint) when its first page can't be read."""
     doc = pymupdf.open(path)
     if len(doc):
         doc.load_page(0)
+    # an incremental save appends to the revision parsed here, so remember which revision that was
+    doc.nerdpdf_file_id = _file_id(path)
     return doc
 
 
@@ -138,6 +149,9 @@ class MainWindow(QMainWindow):
             self.settings.setValue(self._pos_key(self.path), [page, py])
 
     def open(self, path):
+        # write pending edits first: if path is the file already open here, loading it before the
+        # flush would hand us a document parsed from the pre-flush revision, stale on arrival
+        self.flush_edits()
         doc = _load_or_warn(path, self)
         if doc:
             self._show(path, doc)
@@ -194,13 +208,20 @@ class MainWindow(QMainWindow):
     def _save_edits(self):
         doc = self.view.doc
         tmp = doc.name + ".nerdpdf-tmp"
+        # MuPDF builds an increment against the revision the document was parsed from, so appending
+        # to a file that is no longer that revision writes stale object numbers and offsets.
+        same_file = _file_id(doc.name) == getattr(doc, "nerdpdf_file_id", None)
         try:
-            if doc.can_save_incrementally():
+            if same_file and doc.can_save_incrementally():
                 doc.saveIncr()
-            else:  # e.g. a repaired file: rewrite it whole and reopen it
+            else:  # a repaired file, or one replaced behind our back: rewrite it whole
                 doc.save(tmp, garbage=1)
                 os.replace(tmp, doc.name)
-                self.view.reload_document(_load(doc.name))
+            # Reopen after every write. Saving the same document object twice is the trap: the
+            # second increment overwrites the xref of the first while still pointing /Prev at its
+            # old offset, so the chain ends in the middle of an object. MuPDF rebuilds the xref on
+            # load and shows the file anyway, but Preview, Chrome and poppler reject it.
+            self.view.reload_document(_load(doc.name))
         except Exception as e:
             if os.path.exists(tmp):
                 os.remove(tmp)
