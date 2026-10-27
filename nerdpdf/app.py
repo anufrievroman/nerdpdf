@@ -8,7 +8,7 @@ import sys
 from bisect import bisect_left
 
 import pymupdf
-from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QVBoxLayout, QWidget)
@@ -20,6 +20,7 @@ from .view import PdfView, is_image_doc
 
 DOC_TYPES = "*.pdf *.epub *.xps *.cbz"
 SAVE_DELAY = 15_000  # ms after the last annotation change before the PDF is written
+RELOAD_DELAY = 300  # ms to let an external writer finish before we reload
 IMAGE_TYPES = "*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.pnm *.pbm *.pgm *.ppm *.psd *.jxr"
 IMAGE_EXTS = {t[1:] for t in IMAGE_TYPES.split()}
 
@@ -123,6 +124,11 @@ class MainWindow(QMainWindow):
         self._save_timer = QTimer(self, singleShot=True, interval=SAVE_DELAY)
         self._save_timer.timeout.connect(self.flush_edits)
         self.view.documentEdited.connect(self._edited)
+        # reopen the file when it changes on disk outside nerdpdf, discarding any unsaved edits
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.fileChanged.connect(self._watch_changed)
+        self._reload_timer = QTimer(self, singleShot=True, interval=RELOAD_DELAY)
+        self._reload_timer.timeout.connect(self._reload_from_disk)
         self.view.quitRequested.connect(self.close)
         self.view.settingsRequested.connect(self.edit_settings)
         self.view.invertRequested.connect(self.toggle_inverted)
@@ -161,6 +167,7 @@ class MainWindow(QMainWindow):
         self._save_position()
         self._remember_zoom()
         self.path = path
+        self._watch(path)
         self.hide_search()
         self.view.zoom, self.view.fit_mode = self.zoom_pref  # slides and images override this with fit page
         self.view.set_document(doc)
@@ -192,6 +199,29 @@ class MainWindow(QMainWindow):
                     self.view.goto_page(len(doc) - 1)
                 return
             i += step
+
+    def _watch(self, path):
+        if self._watcher.files():
+            self._watcher.removePaths(self._watcher.files())
+        self._watcher.addPath(path)
+
+    def _watch_changed(self, path):
+        # an editor often replaces the file (write + rename) rather than updating it in place,
+        # which drops it from the watch list; put it back so later changes still notify us
+        if path not in self._watcher.files() and os.path.exists(path):
+            self._watcher.addPath(path)
+        self._reload_timer.start()
+
+    def _reload_from_disk(self):
+        """Reopen the current file after an external change, discarding any unsaved edits."""
+        if not self.path or _file_id(self.path) == getattr(self.view.doc, "nerdpdf_file_id", None):
+            return  # nothing actually changed on disk (or this is our own save settling)
+        doc = _load_or_warn(self.path, self)
+        if doc:
+            self._edits_pending = False
+            self._save_timer.stop()
+            self.view.reload_document(doc)
+            self._update_title()
 
     def _edited(self):
         self._edits_pending = True
